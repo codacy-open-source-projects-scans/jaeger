@@ -2,40 +2,48 @@
 
 # Compute major/minor/etc image tags based on the current branch
 
-set -exu
+set -ef -o pipefail
 
-BASE_BUILD_IMAGE=$1
+if [[ -z $QUIET ]]; then
+  set -x
+fi
+
+set -u
+
+BASE_BUILD_IMAGE=${1:?'expecting Docker image name, such as jaegertracing/jaeger'}
 BRANCH=${BRANCH:?'expecting BRANCH env var'}
+GITHUB_SHA=${GITHUB_SHA:?'expecting GITHUB_SHA env var'}
+# allow substituting for ggrep on Mac, since its default grep doesn't grok -P flag.
+GREP=${GREP:-"grep"}
 
-## if we are on a release tag, let's extract the version number
-## the other possible value, currently, is 'main' (or another branch name)
+# accumulate output in this variable
+IMAGE_TAGS=""
+
+# append given tag for docker.io and quay.io
+tags() {
+    if [[ -n "$IMAGE_TAGS" ]]; then
+        # append space
+        IMAGE_TAGS="${IMAGE_TAGS} "
+    fi
+    IMAGE_TAGS="${IMAGE_TAGS}--tag docker.io/${1} --tag quay.io/${1}"
+}
+
+## If we are on a release tag, let's extract the version number.
+## The other possible values are 'main' or another branch name.
 if [[ $BRANCH =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    MAJOR_MINOR_PATCH=$(echo "${BRANCH}" | grep -Po "([\d\.]+)")
+    MAJOR_MINOR_PATCH=$(echo "${BRANCH}" | ${GREP} -Po "([\d\.]+)")
     MAJOR_MINOR=$(echo "${MAJOR_MINOR_PATCH}" | awk -F. '{print $1"."$2}')
     MAJOR=$(echo "${MAJOR_MINOR_PATCH}" | awk -F. '{print $1}')
-else
-    MAJOR_MINOR_PATCH="latest"
-    MAJOR_MINOR=""
-    MAJOR=""
+
+    tags "${BASE_BUILD_IMAGE}:${MAJOR_MINOR_PATCH}"
+    tags "${BASE_BUILD_IMAGE}:${MAJOR_MINOR}"
+    tags "${BASE_BUILD_IMAGE}:${MAJOR}"
+    tags "${BASE_BUILD_IMAGE}:latest"
+elif [[ $BRANCH != "main" ]]; then
+    tags "${BASE_BUILD_IMAGE}:latest"
 fi
 
-# for docker.io and quay.io
-BUILD_IMAGE=${BUILD_IMAGE:-"${BASE_BUILD_IMAGE}:${MAJOR_MINOR_PATCH}"}
-IMAGE_TAGS="--tag docker.io/${BASE_BUILD_IMAGE} --tag docker.io/${BUILD_IMAGE} --tag quay.io/${BASE_BUILD_IMAGE} --tag quay.io/${BUILD_IMAGE}"
-
-if [ "${MAJOR_MINOR}x" != "x" ]; then
-    MAJOR_MINOR_IMAGE="${BASE_BUILD_IMAGE}:${MAJOR_MINOR}"
-    IMAGE_TAGS="${IMAGE_TAGS} --tag docker.io/${MAJOR_MINOR_IMAGE} --tag quay.io/${MAJOR_MINOR_IMAGE}"
-fi
-
-if [ "${MAJOR}x" != "x" ]; then
-    MAJOR_IMAGE="${BASE_BUILD_IMAGE}:${MAJOR}"
-    IMAGE_TAGS="${IMAGE_TAGS} --tag docker.io/${MAJOR_IMAGE} --tag quay.io/${MAJOR_IMAGE}"
-fi
-
-SNAPSHOT_TAG1="${BASE_BUILD_IMAGE}-snapshot:${GITHUB_SHA}"
-IMAGE_TAGS="${IMAGE_TAGS} --tag docker.io/${SNAPSHOT_TAG1} --tag quay.io/${SNAPSHOT_TAG1}"
-SNAPSHOT_TAG2="${BASE_BUILD_IMAGE}-snapshot:latest"
-IMAGE_TAGS="${IMAGE_TAGS} --tag docker.io/${SNAPSHOT_TAG2} --tag quay.io/${SNAPSHOT_TAG2}"
+tags "${BASE_BUILD_IMAGE}-snapshot:${GITHUB_SHA}"
+tags "${BASE_BUILD_IMAGE}-snapshot:latest"
 
 echo "${IMAGE_TAGS}"
