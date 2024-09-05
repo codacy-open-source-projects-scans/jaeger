@@ -1,19 +1,36 @@
 #!/bin/bash
-
+#
 # Copyright (c) 2024 The Jaeger Authors.
 # SPDX-License-Identifier: Apache-2.0
 set -euxf -o pipefail
 
+# This script uses --sort=name option that is not supported by MacOS tar.
+# On MacOS, install `brew install gnu-tar` and run this script with TARCMD=gtar.
 TARCMD=${TARCMD:-tar}
 
-dry_run="false"
-while getopts "d" opt; do
-	# shellcheck disable=SC2220 # we don't need a *) case
-	case "${opt}" in
-	d)
-		dry_run="true"
-		;;
-	esac
+print_help() {
+  echo "Usage: $0 [-h] [-k gpg_key_id] [-p platforms]"
+  echo "-h: Print help"
+  echo "-k: Override default GPG signing key ID. Use 'skip' to skip signing."
+  echo "-p: Comma-separated list of platforms to build for (default: all supported)"
+  exit 1
+}
+
+# Default signing key (accessible to maintainers-only), documented in https://www.jaegertracing.io/download/.
+gpg_key_id="B42D1DB0F079690F"
+platforms="$(make echo-platforms)"
+while getopts "hk:p:" opt; do
+  case "${opt}" in
+  k)
+    gpg_key_id=${OPTARG}
+    ;;
+  p)
+    platforms=${OPTARG}
+    ;;
+  ?)
+    print_help
+    ;;
+  esac
 done
 
 # stage-platform-files stages the different the platform ($1) into the package
@@ -64,6 +81,8 @@ function package {
     local -r PACKAGE_NAME_V2=jaeger-${VERSION_V2}-$PLATFORM
     local -r TOOLS_PACKAGE_NAME=jaeger-tools-${VERSION_V1}-$PLATFORM
 
+    echo "Packaging binaries for $PLATFORM"
+
     PACKAGES=("$PACKAGE_NAME_V1" "$PACKAGE_NAME_V2" "$TOOLS_PACKAGE_NAME")
     for d in "${PACKAGES[@]}"; do
       if [ -d "$d" ]; then
@@ -111,16 +130,17 @@ fi
 rm -rf deploy
 mkdir deploy
 
-package tar linux-amd64
-if [[ "$dry_run" == "false" ]]; then
-  package tar darwin-amd64
-  package tar darwin-arm64
-  package tar windows-amd64 .exe
-  package zip windows-amd64 .exe
-  package tar linux-s390x
-  package tar linux-arm64
-  package tar linux-ppc64le
-fi
+# Loop through each platform (separated by commas)
+for platform in $(echo "$platforms" | tr ',' ' '); do
+  os=${platform%%/*}  # Remove everything after the slash
+  arch=${platform##*/}  # Remove everything before the last slash
+  if [[ "$os" == "windows" ]]; then
+    package tar "${os}-${arch}" .exe
+    package zip "${os}-${arch}" .exe
+  else
+    package tar "${os}-${arch}"
+  fi
+done
 
 # Create a checksum file for all non-checksum files in the deploy directory. Strips the leading 'deploy/' directory from filepaths. Sort by filename.
 find deploy \( ! -name '*sha256sum.txt' \) -type f -exec shasum -b -a 256 {} \; \
@@ -130,7 +150,13 @@ find deploy \( ! -name '*sha256sum.txt' \) -type f -exec shasum -b -a 256 {} \; 
   | tee "./deploy/jaeger-${VERSION_V2}.sha256sum.txt"
 
 # Use gpg to sign the (g)zip files (excluding checksum files) into .asc files.
-find deploy \( ! -name '*sha256sum.txt' \) -type f -exec gpg --armor --detach-sign {} \;
+if [[ "${gpg_key_id}" == "skip" ]]; then
+  echo "Skipping GPG signing as requested"
+else
+  echo "Signing archives with GPG key ${gpg_key_id}"
+  gpg --list-keys "${gpg_key_id}"
+  find deploy \( ! -name '*sha256sum.txt' \) -type f -exec gpg -v --local-user "${gpg_key_id}" --armor --detach-sign {} \;
+fi
 
 # show your work
 ls -lF deploy/

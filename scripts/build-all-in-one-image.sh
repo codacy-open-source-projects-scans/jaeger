@@ -16,7 +16,7 @@ print_help() {
 }
 
 add_debugger='Y'
-platforms="linux/amd64,linux/s390x,linux/ppc64le,linux/arm64"
+platforms="$(make echo-linux-platforms)"
 LOCAL_FLAG=''
 BINARY='all-in-one'
 
@@ -81,7 +81,6 @@ run_integration_test() {
 
 # Loop through each platform (separated by commas)
 for platform in $(echo "$platforms" | tr ',' ' '); do
-  # Extract the architecture from the platform string
   arch=${platform##*/}  # Remove everything before the last slash
   make "build-${BINARY}" GOOS=linux GOARCH="${arch}"
 done
