@@ -4,6 +4,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,12 +23,11 @@ import (
 	"github.com/jaegertracing/jaeger/cmd/query/app/querysvc"
 	"github.com/jaegertracing/jaeger/pkg/bearertoken"
 	"github.com/jaegertracing/jaeger/pkg/config"
-	"github.com/jaegertracing/jaeger/pkg/jtracer"
-	"github.com/jaegertracing/jaeger/pkg/metrics"
-	"github.com/jaegertracing/jaeger/pkg/telemetery"
+	"github.com/jaegertracing/jaeger/pkg/telemetry"
 	"github.com/jaegertracing/jaeger/pkg/tenancy"
 	"github.com/jaegertracing/jaeger/plugin/storage/es"
 	"github.com/jaegertracing/jaeger/ports"
+	"github.com/jaegertracing/jaeger/storage_v2/v1adapter"
 )
 
 const (
@@ -67,6 +67,10 @@ func runQueryService(t *testing.T, esURL string) *Server {
 	flagsSvc := flags.NewService(ports.QueryAdminHTTP)
 	flagsSvc.Logger = zaptest.NewLogger(t)
 
+	telset := telemetry.NoopSettings()
+	telset.Logger = flagsSvc.Logger
+	telset.ReportStatus = telemetry.HCAdapter(flagsSvc.HC())
+
 	f := es.NewFactory()
 	v, command := config.Viperize(f.AddFlags)
 	require.NoError(t, command.ParseFlags([]string{
@@ -77,19 +81,15 @@ func runQueryService(t *testing.T, esURL string) *Server {
 	f.InitFromViper(v, flagsSvc.Logger)
 	// set AllowTokenFromContext manually because we don't register the respective CLI flag from query svc
 	f.Options.Primary.Authentication.BearerTokenAuthentication.AllowFromContext = true
-	require.NoError(t, f.Initialize(metrics.NullFactory, flagsSvc.Logger))
+	require.NoError(t, f.Initialize(telset.Metrics, telset.Logger))
 	defer f.Close()
 
 	spanReader, err := f.CreateSpanReader()
 	require.NoError(t, err)
+	traceReader := v1adapter.NewTraceReader(spanReader)
 
-	querySvc := querysvc.NewQueryService(spanReader, nil, querysvc.QueryServiceOptions{})
-	telset := telemetery.Setting{
-		Logger:         flagsSvc.Logger,
-		TracerProvider: jtracer.NoOp().OTEL,
-		ReportStatus:   telemetery.HCAdapter(flagsSvc.HC()),
-	}
-	server, err := NewServer(querySvc, nil,
+	querySvc := querysvc.NewQueryService(traceReader, nil, querysvc.QueryServiceOptions{})
+	server, err := NewServer(context.Background(), querySvc, nil,
 		&QueryOptions{
 			BearerTokenPropagation: true,
 			HTTP: confighttp.ServerConfig{
@@ -97,7 +97,8 @@ func runQueryService(t *testing.T, esURL string) *Server {
 			},
 			GRPC: configgrpc.ServerConfig{
 				NetAddr: confignet.AddrConfig{
-					Endpoint: ":0",
+					Endpoint:  ":0",
+					Transport: confignet.TransportTypeTCP,
 				},
 			},
 		},
@@ -105,7 +106,7 @@ func runQueryService(t *testing.T, esURL string) *Server {
 		telset,
 	)
 	require.NoError(t, err)
-	require.NoError(t, server.Start())
+	require.NoError(t, server.Start(context.Background()))
 	return server
 }
 

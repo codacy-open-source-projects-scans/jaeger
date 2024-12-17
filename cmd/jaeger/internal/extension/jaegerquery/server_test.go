@@ -5,6 +5,7 @@ package jaegerquery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -15,9 +16,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config/configtelemetry"
-	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/collector/config/confignet"
 	noopmetric "go.opentelemetry.io/otel/metric/noop"
+	nooptrace "go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
@@ -25,12 +26,13 @@ import (
 	"github.com/jaegertracing/jaeger/cmd/query/app/querysvc"
 	"github.com/jaegertracing/jaeger/internal/grpctest"
 	"github.com/jaegertracing/jaeger/pkg/metrics"
+	"github.com/jaegertracing/jaeger/pkg/telemetry"
 	"github.com/jaegertracing/jaeger/pkg/testutils"
 	"github.com/jaegertracing/jaeger/storage"
 	"github.com/jaegertracing/jaeger/storage/dependencystore"
 	depsmocks "github.com/jaegertracing/jaeger/storage/dependencystore/mocks"
-	"github.com/jaegertracing/jaeger/storage/metricsstore"
-	metricsstoremocks "github.com/jaegertracing/jaeger/storage/metricsstore/mocks"
+	"github.com/jaegertracing/jaeger/storage/metricstore"
+	metricstoremocks "github.com/jaegertracing/jaeger/storage/metricstore/mocks"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
 	spanstoremocks "github.com/jaegertracing/jaeger/storage/spanstore/mocks"
 )
@@ -41,28 +43,28 @@ type fakeFactory struct {
 
 func (ff fakeFactory) CreateDependencyReader() (dependencystore.Reader, error) {
 	if ff.name == "need-dependency-reader-error" {
-		return nil, fmt.Errorf("test-error")
+		return nil, errors.New("test-error")
 	}
 	return &depsmocks.Reader{}, nil
 }
 
 func (ff fakeFactory) CreateSpanReader() (spanstore.Reader, error) {
 	if ff.name == "need-span-reader-error" {
-		return nil, fmt.Errorf("test-error")
+		return nil, errors.New("test-error")
 	}
 	return &spanstoremocks.Reader{}, nil
 }
 
 func (ff fakeFactory) CreateSpanWriter() (spanstore.Writer, error) {
 	if ff.name == "need-span-writer-error" {
-		return nil, fmt.Errorf("test-error")
+		return nil, errors.New("test-error")
 	}
 	return &spanstoremocks.Writer{}, nil
 }
 
 func (ff fakeFactory) Initialize(metrics.Factory, *zap.Logger) error {
 	if ff.name == "need-initialize-error" {
-		return fmt.Errorf("test-error")
+		return errors.New("test-error")
 	}
 	return nil
 }
@@ -72,18 +74,18 @@ type fakeMetricsFactory struct {
 }
 
 // Initialize implements storage.MetricsFactory.
-func (fmf fakeMetricsFactory) Initialize(*zap.Logger) error {
+func (fmf fakeMetricsFactory) Initialize(telemetry.Settings) error {
 	if fmf.name == "need-initialize-error" {
-		return fmt.Errorf("test-error")
+		return errors.New("test-error")
 	}
 	return nil
 }
 
-func (fmf fakeMetricsFactory) CreateMetricsReader() (metricsstore.Reader, error) {
+func (fmf fakeMetricsFactory) CreateMetricsReader() (metricstore.Reader, error) {
 	if fmf.name == "need-metrics-reader-error" {
-		return nil, fmt.Errorf("test-error")
+		return nil, errors.New("test-error")
 	}
-	return &metricsstoremocks.Reader{}, nil
+	return &metricstoremocks.Reader{}, nil
 }
 
 type fakeStorageExt struct{}
@@ -97,7 +99,7 @@ func (fakeStorageExt) TraceStorageFactory(name string) (storage.Factory, bool) {
 	return fakeFactory{name: name}, true
 }
 
-func (fakeStorageExt) MetricStorageFactory(name string) (storage.MetricsFactory, bool) {
+func (fakeStorageExt) MetricStorageFactory(name string) (storage.MetricStoreFactory, bool) {
 	if name == "need-factory-error" {
 		return nil, false
 	}
@@ -132,7 +134,7 @@ func TestServerStart(t *testing.T) {
 		expectedErr string
 	}{
 		{
-			name: "Non-empty config with fake storage host",
+			name: "Real server with non-empty config",
 			config: &Config{
 				Storage: Storage{
 					TracesArchive: "jaeger_storage",
@@ -148,7 +150,7 @@ func TestServerStart(t *testing.T) {
 					TracesPrimary: "need-factory-error",
 				},
 			},
-			expectedErr: "cannot find primary storage",
+			expectedErr: "cannot find factory for trace storage",
 		},
 		{
 			name: "span reader error",
@@ -157,7 +159,7 @@ func TestServerStart(t *testing.T) {
 					TracesPrimary: "need-span-reader-error",
 				},
 			},
-			expectedErr: "cannot create span reader",
+			expectedErr: "cannot create trace reader",
 		},
 		{
 			name: "dependency error",
@@ -202,15 +204,17 @@ func TestServerStart(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Despite using Noop Tracer below, query service also creates jtracer.
+			// We want to prevent that tracer from sampling anything in this test.
+			t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
 			telemetrySettings := component.TelemetrySettings{
-				Logger: zaptest.NewLogger(t, zaptest.WrapOptions(zap.AddCaller())),
-				LeveledMeterProvider: func(_ configtelemetry.Level) metric.MeterProvider {
-					return noopmetric.NewMeterProvider()
-				},
-				MeterProvider: noopmetric.NewMeterProvider(),
+				Logger:         zaptest.NewLogger(t, zaptest.WrapOptions(zap.AddCaller())),
+				MeterProvider:  noopmetric.NewMeterProvider(),
+				TracerProvider: nooptrace.NewTracerProvider(),
 			}
-			tt.config.HTTP.Endpoint = ":0"
-			tt.config.GRPC.NetAddr.Endpoint = ":0"
+			tt.config.HTTP.Endpoint = "localhost:0"
+			tt.config.GRPC.NetAddr.Endpoint = "localhost:0"
+			tt.config.GRPC.NetAddr.Transport = confignet.TransportTypeTCP
 			server := newServer(tt.config, telemetrySettings)
 			err := server.Start(context.Background(), host)
 			if tt.expectedErr == "" {
@@ -294,7 +298,9 @@ func TestServerAddArchiveStorage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logger, buf := testutils.NewLogger()
 			telemetrySettings := component.TelemetrySettings{
-				Logger: logger,
+				Logger:         logger,
+				MeterProvider:  noopmetric.NewMeterProvider(),
+				TracerProvider: nooptrace.NewTracerProvider(),
 			}
 			server := newServer(tt.config, telemetrySettings)
 			if tt.extension != nil {
@@ -344,7 +350,9 @@ func TestServerAddMetricsStorage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logger, buf := testutils.NewLogger()
 			telemetrySettings := component.TelemetrySettings{
-				Logger: logger,
+				Logger:         logger,
+				MeterProvider:  noopmetric.NewMeterProvider(),
+				TracerProvider: nooptrace.NewTracerProvider(),
 			}
 			server := newServer(tt.config, telemetrySettings)
 			if tt.extension != nil {

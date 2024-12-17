@@ -8,6 +8,11 @@ set -euxf -o pipefail
 export CASSANDRA_USERNAME="cassandra"
 export CASSANDRA_PASSWORD="cassandra"
 success="false"
+timeout=600
+end_time=$((SECONDS + timeout))
+
+SKIP_APPLY_SCHEMA=${SKIP_APPLY_SCHEMA:-"false"}
+export CASSANDRA_CREATE_SCHEMA=${SKIP_APPLY_SCHEMA}
 
 usage() {
   echo $"Usage: $0 <cassandra_version> <schema_version>"
@@ -24,6 +29,26 @@ check_arg() {
 setup_cassandra() {
   local compose_file=$1
   docker compose -f "$compose_file" up -d
+}
+
+healthcheck_cassandra() {
+  local cas_version=$1
+  local container_name="cassandra-${cas_version}"
+  # Since the healthcheck in cassandra is done at the interval of 30s
+  local wait_seconds=30
+
+  while [ $SECONDS -lt $end_time ]; do
+    status=$(docker inspect -f '{{ .State.Health.Status }}' "${container_name}")
+    if [[ ${status} == "healthy" ]]; then
+      echo "✅ $container_name is healthy"
+      return 0
+    fi
+    echo "Waiting for $container_name to be healthy. Current status: $status"
+    sleep $wait_seconds
+  done
+
+  echo "❌ ERROR: $container_name did not become healthy in time"
+  exit 1
 }
 
 dump_logs() {
@@ -74,8 +99,12 @@ run_integration_test() {
   # shellcheck disable=SC2064
   trap "teardown_cassandra ${compose_file}" EXIT
 
-  apply_schema "$schema_version" "$primaryKeyspace"
-  apply_schema "$schema_version" "$archiveKeyspace"
+  healthcheck_cassandra "${major_version}"
+
+  if [ "${SKIP_APPLY_SCHEMA}" = "false" ]; then
+    apply_schema "$schema_version" "$primaryKeyspace"
+    apply_schema "$schema_version" "$archiveKeyspace"
+  fi
 
   if [ "${jaegerVersion}" = "v1" ]; then
     STORAGE=cassandra make storage-integration-test

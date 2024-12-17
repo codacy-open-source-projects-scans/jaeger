@@ -50,7 +50,7 @@ func TestStartErrors(t *testing.T) {
 		{
 			name:   "bad admin TLS",
 			flags:  []string{"--admin.http.tls.enabled=true", "--admin.http.tls.cert=invalid-cert"},
-			expErr: "cannot initialize admin server",
+			expErr: "cannot start the admin server: failed to load TLS config",
 		},
 		{
 			name:   "bad host:port",
@@ -70,8 +70,7 @@ func TestStartErrors(t *testing.T) {
 			require.NoError(t, err)
 			err = s.Start(v)
 			if test.expErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), test.expErr)
+				require.ErrorContains(t, err, test.expErr)
 				return
 			}
 			require.NoError(t, err)

@@ -4,19 +4,22 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
 
 	"go.opentelemetry.io/collector/component/componentstatus"
+	"go.opentelemetry.io/collector/config/configgrpc"
+	"go.opentelemetry.io/collector/config/confignet"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/reflection"
 
 	"github.com/jaegertracing/jaeger/cmd/query/app/querysvc"
-	"github.com/jaegertracing/jaeger/pkg/telemetery"
+	"github.com/jaegertracing/jaeger/pkg/bearertoken"
+	"github.com/jaegertracing/jaeger/pkg/telemetry"
 	"github.com/jaegertracing/jaeger/pkg/tenancy"
 	"github.com/jaegertracing/jaeger/plugin/storage/grpc/shared"
 	"github.com/jaegertracing/jaeger/storage"
@@ -26,22 +29,21 @@ import (
 
 // Server runs a gRPC server
 type Server struct {
-	opts *Options
-
+	opts       *Options
 	grpcConn   net.Listener
 	grpcServer *grpc.Server
-	wg         sync.WaitGroup
-	telemetery.Setting
+	stopped    sync.WaitGroup
+	telset     telemetry.Settings
 }
 
 // NewServer creates and initializes Server.
-func NewServer(options *Options, storageFactory storage.Factory, tm *tenancy.Manager, telset telemetery.Setting) (*Server, error) {
+func NewServer(options *Options, storageFactory storage.BaseFactory, tm *tenancy.Manager, telset telemetry.Settings) (*Server, error) {
 	handler, err := createGRPCHandler(storageFactory, telset.Logger)
 	if err != nil {
 		return nil, err
 	}
 
-	grpcServer, err := createGRPCServer(options, tm, handler, telset.Logger)
+	grpcServer, err := createGRPCServer(options, tm, handler, telset)
 	if err != nil {
 		return nil, err
 	}
@@ -49,11 +51,11 @@ func NewServer(options *Options, storageFactory storage.Factory, tm *tenancy.Man
 	return &Server{
 		opts:       options,
 		grpcServer: grpcServer,
-		Setting:    telset,
+		telset:     telset,
 	}, nil
 }
 
-func createGRPCHandler(f storage.Factory, logger *zap.Logger) (*shared.GRPCHandler, error) {
+func createGRPCHandler(f storage.BaseFactory, logger *zap.Logger) (*shared.GRPCHandler, error) {
 	reader, err := f.CreateSpanReader()
 	if err != nil {
 		return nil, err
@@ -85,25 +87,28 @@ func createGRPCHandler(f storage.Factory, logger *zap.Logger) (*shared.GRPCHandl
 	return handler, nil
 }
 
-func createGRPCServer(opts *Options, tm *tenancy.Manager, handler *shared.GRPCHandler, logger *zap.Logger) (*grpc.Server, error) {
-	var grpcOpts []grpc.ServerOption
-
-	if opts.TLSGRPC.Enabled {
-		tlsCfg, err := opts.TLSGRPC.Config(logger)
-		if err != nil {
-			return nil, fmt.Errorf("invalid TLS config: %w", err)
-		}
-		creds := credentials.NewTLS(tlsCfg)
-		grpcOpts = append(grpcOpts, grpc.Creds(creds))
+func createGRPCServer(opts *Options, tm *tenancy.Manager, handler *shared.GRPCHandler, telset telemetry.Settings) (*grpc.Server, error) {
+	unaryInterceptors := []grpc.UnaryServerInterceptor{
+		bearertoken.NewUnaryServerInterceptor(),
+	}
+	streamInterceptors := []grpc.StreamServerInterceptor{
+		bearertoken.NewStreamServerInterceptor(),
 	}
 	if tm.Enabled {
-		grpcOpts = append(grpcOpts,
-			grpc.StreamInterceptor(tenancy.NewGuardingStreamInterceptor(tm)),
-			grpc.UnaryInterceptor(tenancy.NewGuardingUnaryInterceptor(tm)),
-		)
+		unaryInterceptors = append(unaryInterceptors, tenancy.NewGuardingUnaryInterceptor(tm))
+		streamInterceptors = append(streamInterceptors, tenancy.NewGuardingStreamInterceptor(tm))
 	}
 
-	server := grpc.NewServer(grpcOpts...)
+	opts.NetAddr.Transport = confignet.TransportTypeTCP
+	server, err := opts.ToServer(context.Background(),
+		telset.Host,
+		telset.ToOtelComponent(),
+		configgrpc.WithGrpcServerOption(grpc.ChainUnaryInterceptor(unaryInterceptors...)),
+		configgrpc.WithGrpcServerOption(grpc.ChainStreamInterceptor(streamInterceptors...)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gRPC server: %w", err)
+	}
 	healthServer := health.NewServer()
 	reflection.Register(server)
 	handler.Register(server, healthServer)
@@ -113,18 +118,18 @@ func createGRPCServer(opts *Options, tm *tenancy.Manager, handler *shared.GRPCHa
 
 // Start gRPC server concurrently
 func (s *Server) Start() error {
-	listener, err := net.Listen("tcp", s.opts.GRPCHostPort)
+	var err error
+	s.grpcConn, err = s.opts.NetAddr.Listen(context.Background())
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to listen on gRPC port: %w", err)
 	}
-	s.Logger.Info("Starting GRPC server", zap.Stringer("addr", listener.Addr()))
-	s.grpcConn = listener
-	s.wg.Add(1)
+	s.telset.Logger.Info("Starting GRPC server", zap.Stringer("addr", s.grpcConn.Addr()))
+	s.stopped.Add(1)
 	go func() {
-		defer s.wg.Done()
+		defer s.stopped.Done()
 		if err := s.grpcServer.Serve(s.grpcConn); err != nil {
-			s.Logger.Error("GRPC server exited", zap.Error(err))
-			s.ReportStatus(componentstatus.NewFatalErrorEvent(err))
+			s.telset.Logger.Error("GRPC server exited", zap.Error(err))
+			s.telset.ReportStatus(componentstatus.NewFatalErrorEvent(err))
 		}
 	}()
 
@@ -134,9 +139,7 @@ func (s *Server) Start() error {
 // Close stops http, GRPC servers and closes the port listener.
 func (s *Server) Close() error {
 	s.grpcServer.Stop()
-	s.grpcConn.Close()
-	s.opts.TLSGRPC.Close()
-	s.wg.Wait()
-	s.ReportStatus(componentstatus.NewEvent(componentstatus.StatusStopped))
+	s.stopped.Wait()
+	s.telset.ReportStatus(componentstatus.NewEvent(componentstatus.StatusStopped))
 	return nil
 }

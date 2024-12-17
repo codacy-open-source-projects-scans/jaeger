@@ -6,7 +6,6 @@ package apiv3
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,36 +15,32 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 
 	"github.com/jaegertracing/jaeger/cmd/query/app/querysvc"
-	"github.com/jaegertracing/jaeger/model"
 	"github.com/jaegertracing/jaeger/pkg/jtracer"
-	"github.com/jaegertracing/jaeger/pkg/tenancy"
 	"github.com/jaegertracing/jaeger/pkg/testutils"
-	dependencyStoreMocks "github.com/jaegertracing/jaeger/storage/dependencystore/mocks"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
 	spanstoremocks "github.com/jaegertracing/jaeger/storage/spanstore/mocks"
+	dependencyStoreMocks "github.com/jaegertracing/jaeger/storage_v2/depstore/mocks"
+	"github.com/jaegertracing/jaeger/storage_v2/v1adapter"
 )
 
 func setupHTTPGatewayNoServer(
 	_ *testing.T,
 	basePath string,
-	tenancyOptions tenancy.Options,
 ) *testGateway {
 	gw := &testGateway{
 		reader: &spanstoremocks.Reader{},
 	}
 
-	q := querysvc.NewQueryService(gw.reader,
+	q := querysvc.NewQueryService(v1adapter.NewTraceReader(gw.reader),
 		&dependencyStoreMocks.Reader{},
 		querysvc.QueryServiceOptions{},
 	)
 
 	hgw := &HTTPGateway{
 		QueryService: q,
-		TenancyMgr:   tenancy.NewManager(&tenancyOptions),
 		Logger:       zap.NewNop(),
 		Tracer:       jtracer.NoOp().OTEL,
 	}
@@ -61,9 +56,8 @@ func setupHTTPGatewayNoServer(
 func setupHTTPGateway(
 	t *testing.T,
 	basePath string,
-	tenancyOptions tenancy.Options,
 ) *testGateway {
-	gw := setupHTTPGatewayNoServer(t, basePath, tenancyOptions)
+	gw := setupHTTPGatewayNoServer(t, basePath)
 
 	httpServer := httptest.NewServer(gw.router)
 	t.Cleanup(func() { httpServer.Close() })
@@ -76,22 +70,7 @@ func setupHTTPGateway(
 }
 
 func TestHTTPGateway(t *testing.T) {
-	for _, ten := range []bool{false, true} {
-		t.Run(fmt.Sprintf("tenancy=%v", ten), func(t *testing.T) {
-			tenancyOptions := tenancy.Options{
-				Enabled: ten,
-			}
-			tm := tenancy.NewManager(&tenancyOptions)
-			runGatewayTests(t, "/",
-				tenancyOptions,
-				func(req *http.Request) {
-					if ten {
-						// Add a tenancy header on outbound requests
-						req.Header.Add(tm.Header, "dummy")
-					}
-				})
-		})
-	}
+	runGatewayTests(t, "/", func(_ *http.Request) {})
 }
 
 func TestHTTPGatewayTryHandleError(t *testing.T) {
@@ -111,22 +90,8 @@ func TestHTTPGatewayTryHandleError(t *testing.T) {
 	assert.Contains(t, string(w.Body.String()), e, "writes error message to body")
 }
 
-func TestHTTPGatewayOTLPError(t *testing.T) {
-	w := httptest.NewRecorder()
-	gw := &HTTPGateway{
-		Logger: zap.NewNop(),
-	}
-	const simErr = "simulated error"
-	gw.returnSpansTestable(nil, w,
-		func(_ []*model.Span) (ptrace.Traces, error) {
-			return ptrace.Traces{}, errors.New(simErr)
-		},
-	)
-	assert.Contains(t, w.Body.String(), simErr)
-}
-
 func TestHTTPGatewayGetTraceErrors(t *testing.T) {
-	gw := setupHTTPGatewayNoServer(t, "", tenancy.Options{})
+	gw := setupHTTPGatewayNoServer(t, "")
 
 	// malformed trace id
 	r, err := http.NewRequest(http.MethodGet, "/api/v3/traces/xyz", nil)
@@ -138,7 +103,7 @@ func TestHTTPGatewayGetTraceErrors(t *testing.T) {
 	// error from span reader
 	const simErr = "simulated error"
 	gw.reader.
-		On("GetTrace", matchContext, matchTraceID).
+		On("GetTrace", matchContext, matchGetTraceParameters).
 		Return(nil, errors.New(simErr)).Once()
 
 	r, err = http.NewRequest(http.MethodGet, "/api/v3/traces/123", nil)
@@ -233,7 +198,7 @@ func TestHTTPGatewayFindTracesErrors(t *testing.T) {
 			require.NoError(t, err)
 			w := httptest.NewRecorder()
 
-			gw := setupHTTPGatewayNoServer(t, "", tenancy.Options{})
+			gw := setupHTTPGatewayNoServer(t, "")
 			gw.router.ServeHTTP(w, r)
 			assert.Contains(t, w.Body.String(), tc.expErr)
 		})
@@ -245,7 +210,7 @@ func TestHTTPGatewayFindTracesErrors(t *testing.T) {
 		require.NoError(t, err)
 		w := httptest.NewRecorder()
 
-		gw := setupHTTPGatewayNoServer(t, "", tenancy.Options{})
+		gw := setupHTTPGatewayNoServer(t, "")
 		gw.reader.
 			On("FindTraces", matchContext, qp).
 			Return(nil, errors.New(simErr)).Once()
@@ -256,7 +221,7 @@ func TestHTTPGatewayFindTracesErrors(t *testing.T) {
 }
 
 func TestHTTPGatewayGetServicesErrors(t *testing.T) {
-	gw := setupHTTPGatewayNoServer(t, "", tenancy.Options{})
+	gw := setupHTTPGatewayNoServer(t, "")
 
 	const simErr = "simulated error"
 	gw.reader.
@@ -271,7 +236,7 @@ func TestHTTPGatewayGetServicesErrors(t *testing.T) {
 }
 
 func TestHTTPGatewayGetOperationsErrors(t *testing.T) {
-	gw := setupHTTPGatewayNoServer(t, "", tenancy.Options{})
+	gw := setupHTTPGatewayNoServer(t, "")
 
 	qp := spanstore.OperationQueryParameters{ServiceName: "foo", SpanKind: "server"}
 	const simErr = "simulated error"
@@ -284,42 +249,4 @@ func TestHTTPGatewayGetOperationsErrors(t *testing.T) {
 	w := httptest.NewRecorder()
 	gw.router.ServeHTTP(w, r)
 	assert.Contains(t, w.Body.String(), simErr)
-}
-
-func TestHTTPGatewayTenancyRejection(t *testing.T) {
-	basePath := "/"
-	tenancyOptions := tenancy.Options{Enabled: true}
-	gw := setupHTTPGateway(t, basePath, tenancyOptions)
-
-	traceID := model.NewTraceID(150, 160)
-	gw.reader.On("GetTrace", matchContext, matchTraceID).Return(
-		&model.Trace{
-			Spans: []*model.Span{
-				{
-					TraceID:       traceID,
-					SpanID:        model.NewSpanID(180),
-					OperationName: "foobar",
-				},
-			},
-		}, nil).Once()
-
-	req, err := http.NewRequest(http.MethodGet, gw.url+"/api/v3/traces/123", nil)
-	require.NoError(t, err)
-	req.Header.Set("Content-Type", "application/json")
-	// We don't set tenant header
-	response, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	body, err := io.ReadAll(response.Body)
-	require.NoError(t, err)
-	require.NoError(t, response.Body.Close())
-	require.Equal(t, http.StatusUnauthorized, response.StatusCode, "response=%s", string(body))
-
-	// Try again with tenant header set
-	tm := tenancy.NewManager(&tenancyOptions)
-	req.Header.Set(tm.Header, "acme")
-	response, err = http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	require.NoError(t, response.Body.Close())
-	require.Equal(t, http.StatusOK, response.StatusCode)
-	// Skip unmarshal of response; it is enough that it succeeded
 }

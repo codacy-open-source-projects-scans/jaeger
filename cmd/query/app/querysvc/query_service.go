@@ -13,8 +13,10 @@ import (
 	"github.com/jaegertracing/jaeger/model"
 	"github.com/jaegertracing/jaeger/model/adjuster"
 	"github.com/jaegertracing/jaeger/storage"
-	"github.com/jaegertracing/jaeger/storage/dependencystore"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
+	"github.com/jaegertracing/jaeger/storage_v2/depstore"
+	"github.com/jaegertracing/jaeger/storage_v2/tracestore"
+	"github.com/jaegertracing/jaeger/storage_v2/v1adapter"
 )
 
 var errNoArchiveSpanStorage = errors.New("archive span storage was not configured")
@@ -40,15 +42,15 @@ type StorageCapabilities struct {
 
 // QueryService contains span utils required by the query-service.
 type QueryService struct {
-	spanReader       spanstore.Reader
-	dependencyReader dependencystore.Reader
+	traceReader      tracestore.Reader
+	dependencyReader depstore.Reader
 	options          QueryServiceOptions
 }
 
 // NewQueryService returns a new QueryService.
-func NewQueryService(spanReader spanstore.Reader, dependencyReader dependencystore.Reader, options QueryServiceOptions) *QueryService {
+func NewQueryService(traceReader tracestore.Reader, dependencyReader depstore.Reader, options QueryServiceOptions) *QueryService {
 	qsvc := &QueryService{
-		spanReader:       spanReader,
+		traceReader:      traceReader,
 		dependencyReader: dependencyReader,
 		options:          options,
 	}
@@ -60,20 +62,28 @@ func NewQueryService(spanReader spanstore.Reader, dependencyReader dependencysto
 }
 
 // GetTrace is the queryService implementation of spanstore.Reader.GetTrace
-func (qs QueryService) GetTrace(ctx context.Context, traceID model.TraceID) (*model.Trace, error) {
-	trace, err := qs.spanReader.GetTrace(ctx, traceID)
+func (qs QueryService) GetTrace(ctx context.Context, query spanstore.GetTraceParameters) (*model.Trace, error) {
+	spanReader, err := v1adapter.GetV1Reader(qs.traceReader)
+	if err != nil {
+		return nil, err
+	}
+	trace, err := spanReader.GetTrace(ctx, query)
 	if errors.Is(err, spanstore.ErrTraceNotFound) {
 		if qs.options.ArchiveSpanReader == nil {
 			return nil, err
 		}
-		trace, err = qs.options.ArchiveSpanReader.GetTrace(ctx, traceID)
+		trace, err = qs.options.ArchiveSpanReader.GetTrace(ctx, query)
 	}
 	return trace, err
 }
 
 // GetServices is the queryService implementation of spanstore.Reader.GetServices
 func (qs QueryService) GetServices(ctx context.Context) ([]string, error) {
-	return qs.spanReader.GetServices(ctx)
+	spanReader, err := v1adapter.GetV1Reader(qs.traceReader)
+	if err != nil {
+		return nil, err
+	}
+	return spanReader.GetServices(ctx)
 }
 
 // GetOperations is the queryService implementation of spanstore.Reader.GetOperations
@@ -81,20 +91,28 @@ func (qs QueryService) GetOperations(
 	ctx context.Context,
 	query spanstore.OperationQueryParameters,
 ) ([]spanstore.Operation, error) {
-	return qs.spanReader.GetOperations(ctx, query)
+	spanReader, err := v1adapter.GetV1Reader(qs.traceReader)
+	if err != nil {
+		return nil, err
+	}
+	return spanReader.GetOperations(ctx, query)
 }
 
 // FindTraces is the queryService implementation of spanstore.Reader.FindTraces
 func (qs QueryService) FindTraces(ctx context.Context, query *spanstore.TraceQueryParameters) ([]*model.Trace, error) {
-	return qs.spanReader.FindTraces(ctx, query)
+	spanReader, err := v1adapter.GetV1Reader(qs.traceReader)
+	if err != nil {
+		return nil, err
+	}
+	return spanReader.FindTraces(ctx, query)
 }
 
 // ArchiveTrace is the queryService utility to archive traces.
-func (qs QueryService) ArchiveTrace(ctx context.Context, traceID model.TraceID) error {
+func (qs QueryService) ArchiveTrace(ctx context.Context, query spanstore.GetTraceParameters) error {
 	if qs.options.ArchiveSpanWriter == nil {
 		return errNoArchiveSpanStorage
 	}
-	trace, err := qs.GetTrace(ctx, traceID)
+	trace, err := qs.GetTrace(ctx, query)
 	if err != nil {
 		return err
 	}
@@ -116,7 +134,10 @@ func (qs QueryService) Adjust(trace *model.Trace) (*model.Trace, error) {
 
 // GetDependencies implements dependencystore.Reader.GetDependencies
 func (qs QueryService) GetDependencies(ctx context.Context, endTs time.Time, lookback time.Duration) ([]model.DependencyLink, error) {
-	return qs.dependencyReader.GetDependencies(ctx, endTs, lookback)
+	return qs.dependencyReader.GetDependencies(ctx, depstore.QueryParameters{
+		StartTime: endTs.Add(-lookback),
+		EndTime:   endTs,
+	})
 }
 
 // GetCapabilities returns the features supported by the query service.
@@ -127,7 +148,7 @@ func (qs QueryService) GetCapabilities() StorageCapabilities {
 }
 
 // InitArchiveStorage tries to initialize archive storage reader/writer if storage factory supports them.
-func (opts *QueryServiceOptions) InitArchiveStorage(storageFactory storage.Factory, logger *zap.Logger) bool {
+func (opts *QueryServiceOptions) InitArchiveStorage(storageFactory storage.BaseFactory, logger *zap.Logger) bool {
 	archiveFactory, ok := storageFactory.(storage.ArchiveFactory)
 	if !ok {
 		logger.Info("Archive storage not supported by the factory")

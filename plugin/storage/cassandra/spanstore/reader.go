@@ -151,9 +151,9 @@ func (s *SpanReader) readTrace(ctx context.Context, traceID dbmodel.TraceID) (*m
 	defer span.End()
 	span.SetAttributes(attribute.Key("trace_id").String(traceID.String()))
 
-	trace, err := s.readTraceInSpan(ctx, traceID)
+	trc, err := s.readTraceInSpan(ctx, traceID)
 	logErrorToSpan(span, err)
-	return trace, err
+	return trc, err
 }
 
 func (s *SpanReader) readTraceInSpan(_ context.Context, traceID dbmodel.TraceID) (*model.Trace, error) {
@@ -204,8 +204,8 @@ func (s *SpanReader) readTraceInSpan(_ context.Context, traceID dbmodel.TraceID)
 }
 
 // GetTrace takes a traceID and returns a Trace associated with that traceID
-func (s *SpanReader) GetTrace(ctx context.Context, traceID model.TraceID) (*model.Trace, error) {
-	return s.readTrace(ctx, dbmodel.TraceIDFromDomain(traceID))
+func (s *SpanReader) GetTrace(ctx context.Context, query spanstore.GetTraceParameters) (*model.Trace, error) {
+	return s.readTrace(ctx, dbmodel.TraceIDFromDomain(query.TraceID))
 }
 
 func validateQuery(p *spanstore.TraceQueryParameters) error {
@@ -238,7 +238,7 @@ func (s *SpanReader) FindTraces(ctx context.Context, traceQuery *spanstore.Trace
 	}
 	var retMe []*model.Trace
 	for _, traceID := range uniqueTraceIDs {
-		jTrace, err := s.GetTrace(ctx, traceID)
+		jTrace, err := s.GetTrace(ctx, spanstore.GetTraceParameters{TraceID: traceID})
 		if err != nil {
 			s.logger.Error("Failure to read trace", zap.String("trace_id", traceID.String()), zap.Error(err))
 			continue

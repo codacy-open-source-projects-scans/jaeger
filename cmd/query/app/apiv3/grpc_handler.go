@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/gogo/protobuf/types"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -33,26 +32,37 @@ func (h *Handler) GetTrace(request *api_v3.GetTraceRequest, stream api_v3.QueryS
 		return fmt.Errorf("malform trace ID: %w", err)
 	}
 
-	trace, err := h.QueryService.GetTrace(stream.Context(), traceID)
+	query := spanstore.GetTraceParameters{
+		TraceID:   traceID,
+		StartTime: request.GetStartTime(),
+		EndTime:   request.GetEndTime(),
+	}
+	trace, err := h.QueryService.GetTrace(stream.Context(), query)
 	if err != nil {
 		return fmt.Errorf("cannot retrieve trace: %w", err)
 	}
-	td, err := modelToOTLP(trace.GetSpans())
-	if err != nil {
-		return err
-	}
+	td := modelToOTLP(trace.GetSpans())
 	tracesData := api_v3.TracesData(td)
 	return stream.Send(&tracesData)
 }
 
 // FindTraces implements api_v3.QueryServiceServer's FindTraces
 func (h *Handler) FindTraces(request *api_v3.FindTracesRequest, stream api_v3.QueryService_FindTracesServer) error {
+	return h.internalFindTraces(stream.Context(), request, stream.Send)
+}
+
+// separated for testing
+func (h *Handler) internalFindTraces(
+	ctx context.Context,
+	request *api_v3.FindTracesRequest,
+	streamSend func(*api_v3.TracesData) error,
+) error {
 	query := request.GetQuery()
 	if query == nil {
 		return status.Error(codes.InvalidArgument, "missing query")
 	}
-	if query.GetStartTimeMin() == nil ||
-		query.GetStartTimeMax() == nil {
+	if query.GetStartTimeMin().IsZero() ||
+		query.GetStartTimeMax().IsZero() {
 		return errors.New("start time min and max are required parameters")
 	}
 
@@ -60,48 +70,32 @@ func (h *Handler) FindTraces(request *api_v3.FindTracesRequest, stream api_v3.Qu
 		ServiceName:   query.GetServiceName(),
 		OperationName: query.GetOperationName(),
 		Tags:          query.GetAttributes(),
-		NumTraces:     int(query.GetNumTraces()),
+		NumTraces:     int(query.GetSearchDepth()),
 	}
-	if query.GetStartTimeMin() != nil {
-		startTimeMin, err := types.TimestampFromProto(query.GetStartTimeMin())
-		if err != nil {
-			return err
-		}
-		queryParams.StartTimeMin = startTimeMin
+	if ts := query.GetStartTimeMin(); !ts.IsZero() {
+		queryParams.StartTimeMin = ts
 	}
-	if query.GetStartTimeMax() != nil {
-		startTimeMax, err := types.TimestampFromProto(query.GetStartTimeMax())
-		if err != nil {
-			return err
-		}
-		queryParams.StartTimeMax = startTimeMax
+	if ts := query.GetStartTimeMax(); !ts.IsZero() {
+		queryParams.StartTimeMax = ts
 	}
-	if query.GetDurationMin() != nil {
-		durationMin, err := types.DurationFromProto(query.GetDurationMin())
-		if err != nil {
-			return err
-		}
-		queryParams.DurationMin = durationMin
+	if d := query.GetDurationMin(); d != 0 {
+		queryParams.DurationMin = d
 	}
-	if query.GetDurationMax() != nil {
-		durationMax, err := types.DurationFromProto(query.GetDurationMax())
-		if err != nil {
-			return err
-		}
-		queryParams.DurationMax = durationMax
+	if d := query.GetDurationMax(); d != 0 {
+		queryParams.DurationMax = d
 	}
 
-	traces, err := h.QueryService.FindTraces(stream.Context(), queryParams)
+	traces, err := h.QueryService.FindTraces(ctx, queryParams)
 	if err != nil {
 		return err
 	}
 	for _, t := range traces {
-		td, err := modelToOTLP(t.GetSpans())
-		if err != nil {
-			return err
-		}
+		td := modelToOTLP(t.GetSpans())
 		tracesData := api_v3.TracesData(td)
-		stream.Send(&tracesData)
+		if err := streamSend(&tracesData); err != nil {
+			return status.Error(codes.Internal,
+				fmt.Sprintf("failed to send response stream chunk to client: %v", err))
+		}
 	}
 	return nil
 }

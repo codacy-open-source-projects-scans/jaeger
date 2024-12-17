@@ -30,7 +30,7 @@ import (
 	"github.com/jaegertracing/jaeger/pkg/es"
 	eswrapper "github.com/jaegertracing/jaeger/pkg/es/wrapper"
 	"github.com/jaegertracing/jaeger/pkg/metrics"
-	storageMetrics "github.com/jaegertracing/jaeger/storage/spanstore/metrics"
+	"github.com/jaegertracing/jaeger/storage/spanstore/spanstoremetrics"
 )
 
 const (
@@ -40,7 +40,11 @@ const (
 // IndexOptions describes the index format and rollover frequency
 type IndexOptions struct {
 	// Priority contains the priority of index template (ESv8 only).
-	Priority   int64  `mapstructure:"priority"`
+	Priority int64 `mapstructure:"priority"`
+	// DateLayout contains the format string used to format current time to part of the index name.
+	// For example, "2006-01-02" layout will result in "jaeger-spans-yyyy-mm-dd".
+	// If not specified, the default value is "2006-01-02".
+	// See https://pkg.go.dev/time#Layout for more details on the syntax.
 	DateLayout string `mapstructure:"date_layout"`
 	// Shards is the number of shards per index in Elasticsearch.
 	Shards int64 `mapstructure:"shards"`
@@ -213,7 +217,7 @@ func NewClient(c *Configuration, logger *zap.Logger, metricsFactory metrics.Fact
 		return nil, err
 	}
 
-	sm := storageMetrics.NewWriteMetrics(metricsFactory, "bulk_index")
+	sm := spanstoremetrics.NewWriter(metricsFactory, "bulk_index")
 	m := sync.Map{}
 
 	bulkProc, err := rawClient.BulkProcessor().
@@ -460,7 +464,7 @@ func (c *Configuration) getConfigOptions(logger *zap.Logger) ([]elastic.ClientOp
 	options = append(options, elastic.SetHttpClient(httpClient))
 
 	if c.Authentication.BasicAuthentication.Password != "" && c.Authentication.BasicAuthentication.PasswordFilePath != "" {
-		return nil, fmt.Errorf("both Password and PasswordFilePath are set")
+		return nil, errors.New("both Password and PasswordFilePath are set")
 	}
 	if c.Authentication.BasicAuthentication.PasswordFilePath != "" {
 		passwordFromFile, err := loadTokenFromFile(c.Authentication.BasicAuthentication.PasswordFilePath)

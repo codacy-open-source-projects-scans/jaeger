@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/olivere/elastic"
@@ -21,7 +22,6 @@ import (
 	"github.com/jaegertracing/jaeger/model"
 	"github.com/jaegertracing/jaeger/pkg/es"
 	cfg "github.com/jaegertracing/jaeger/pkg/es/config"
-	"github.com/jaegertracing/jaeger/pkg/metrics"
 	"github.com/jaegertracing/jaeger/plugin/storage/es/spanstore/dbmodel"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
 )
@@ -112,7 +112,6 @@ type SpanReaderParams struct {
 	Archive             bool
 	UseReadWriteAliases bool
 	RemoteReadClusters  []string
-	MetricsFactory      metrics.Factory
 	Logger              *zap.Logger
 	Tracer              trace.Tracer
 }
@@ -135,18 +134,32 @@ func NewSpanReader(p SpanReaderParams) *SpanReader {
 		spanIndex:               p.SpanIndex,
 		serviceIndex:            p.ServiceIndex,
 		spanConverter:           dbmodel.NewToDomain(p.TagDotReplacement),
-		timeRangeIndices:        getTimeRangeIndexFn(p.Archive, p.UseReadWriteAliases, p.RemoteReadClusters),
-		sourceFn:                getSourceFn(p.Archive, p.MaxDocCount),
-		maxDocCount:             p.MaxDocCount,
-		useReadWriteAliases:     p.UseReadWriteAliases,
-		logger:                  p.Logger,
-		tracer:                  p.Tracer,
+		timeRangeIndices: getLoggingTimeRangeIndexFn(
+			p.Logger,
+			getTimeRangeIndexFn(p.Archive, p.UseReadWriteAliases, p.RemoteReadClusters),
+		),
+		sourceFn:            getSourceFn(p.Archive, p.MaxDocCount),
+		maxDocCount:         p.MaxDocCount,
+		useReadWriteAliases: p.UseReadWriteAliases,
+		logger:              p.Logger,
+		tracer:              p.Tracer,
 	}
 }
 
 type timeRangeIndexFn func(indexName string, indexDateLayout string, startTime time.Time, endTime time.Time, reduceDuration time.Duration) []string
 
 type sourceFn func(query elastic.Query, nextTime uint64) *elastic.SearchSource
+
+func getLoggingTimeRangeIndexFn(logger *zap.Logger, fn timeRangeIndexFn) timeRangeIndexFn {
+	if !logger.Core().Enabled(zap.DebugLevel) {
+		return fn
+	}
+	return func(indexName string, indexDateLayout string, startTime time.Time, endTime time.Time, reduceDuration time.Duration) []string {
+		indices := fn(indexName, indexDateLayout, startTime, endTime, reduceDuration)
+		logger.Debug("Reading from ES indices", zap.Strings("index", indices))
+		return indices
+	}
+}
 
 func getTimeRangeIndexFn(archive, useReadWriteAliases bool, remoteReadClusters []string) timeRangeIndexFn {
 	if archive {
@@ -218,11 +231,12 @@ func timeRangeIndices(indexName, indexDateLayout string, startTime time.Time, en
 }
 
 // GetTrace takes a traceID and returns a Trace associated with that traceID
-func (s *SpanReader) GetTrace(ctx context.Context, traceID model.TraceID) (*model.Trace, error) {
+func (s *SpanReader) GetTrace(ctx context.Context, query spanstore.GetTraceParameters) (*model.Trace, error) {
 	ctx, span := s.tracer.Start(ctx, "GetTrace")
 	defer span.End()
 	currentTime := time.Now()
-	traces, err := s.multiRead(ctx, []model.TraceID{traceID}, currentTime.Add(-s.maxSpanAge), currentTime)
+	// TODO: use start time & end time in "query" struct
+	traces, err := s.multiRead(ctx, []model.TraceID{query.TraceID}, currentTime.Add(-s.maxSpanAge), currentTime)
 	if err != nil {
 		return nil, es.DetailedError(err)
 	}
@@ -444,8 +458,8 @@ func (s *SpanReader) multiRead(ctx context.Context, traceIDs []model.TraceID, st
 	}
 
 	var traces []*model.Trace
-	for _, trace := range tracesMap {
-		traces = append(traces, trace)
+	for _, t := range tracesMap {
+		traces = append(traces, t)
 	}
 	return traces, nil
 }
@@ -460,7 +474,7 @@ func buildTraceByIDQuery(traceID model.TraceID) elastic.Query {
 	// TODO remove in newer versions, added in Jaeger 1.16
 	var legacyTraceID string
 	if traceID.High == 0 {
-		legacyTraceID = fmt.Sprintf("%x", traceID.Low)
+		legacyTraceID = strconv.FormatUint(traceID.Low, 16)
 	} else {
 		legacyTraceID = fmt.Sprintf("%x%016x", traceID.High, traceID.Low)
 	}

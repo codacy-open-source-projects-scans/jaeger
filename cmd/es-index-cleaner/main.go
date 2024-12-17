@@ -4,7 +4,9 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,7 +19,6 @@ import (
 
 	"github.com/jaegertracing/jaeger/cmd/es-index-cleaner/app"
 	"github.com/jaegertracing/jaeger/pkg/config"
-	"github.com/jaegertracing/jaeger/pkg/config/tlscfg"
 	"github.com/jaegertracing/jaeger/pkg/es/client"
 )
 
@@ -25,7 +26,6 @@ func main() {
 	logger, _ := zap.NewProduction()
 	v := viper.New()
 	cfg := &app.Config{}
-	tlsFlags := tlscfg.ClientFlagsConfig{Prefix: "es"}
 
 	command := &cobra.Command{
 		Use:   "jaeger-es-index-cleaner NUM_OF_DAYS http://HOSTNAME:PORT",
@@ -33,7 +33,7 @@ func main() {
 		Long:  "Jaeger es-index-cleaner removes Jaeger indices",
 		RunE: func(_ *cobra.Command, args []string) error {
 			if len(args) != 2 {
-				return fmt.Errorf("wrong number of arguments")
+				return errors.New("wrong number of arguments")
 			}
 			numOfDays, err := strconv.Atoi(args[0])
 			if err != nil {
@@ -41,21 +41,18 @@ func main() {
 			}
 
 			cfg.InitFromViper(v)
-			tlsOpts, err := tlsFlags.InitFromViper(v)
+
+			ctx := context.Background()
+			tlscfg, err := cfg.TLSConfig.LoadTLSConfig(ctx)
 			if err != nil {
-				return err
+				return fmt.Errorf("error loading tls config : %w", err)
 			}
-			tlsCfg, err := tlsOpts.Config(logger)
-			if err != nil {
-				return err
-			}
-			defer tlsOpts.Close()
 
 			c := &http.Client{
 				Timeout: time.Duration(cfg.MasterNodeTimeoutSeconds) * time.Second,
 				Transport: &http.Transport{
 					Proxy:           http.ProxyFromEnvironment,
-					TLSClientConfig: tlsCfg,
+					TLSClientConfig: tlscfg,
 				},
 			}
 			i := client.IndicesClient{
@@ -100,7 +97,6 @@ func main() {
 		v,
 		command,
 		cfg.AddFlags,
-		tlsFlags.AddFlags,
 	)
 
 	if err := command.Execute(); err != nil {

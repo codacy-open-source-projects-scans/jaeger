@@ -16,16 +16,17 @@ import (
 	"github.com/jaegertracing/jaeger/cmd/query/app"
 	"github.com/jaegertracing/jaeger/cmd/query/app/querysvc"
 	"github.com/jaegertracing/jaeger/model"
-	"github.com/jaegertracing/jaeger/plugin/metrics/disabled"
+	"github.com/jaegertracing/jaeger/plugin/metricstore/disabled"
 	"github.com/jaegertracing/jaeger/proto-gen/api_v2"
-	dependencyStoreMocks "github.com/jaegertracing/jaeger/storage/dependencystore/mocks"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
 	spanstoremocks "github.com/jaegertracing/jaeger/storage/spanstore/mocks"
+	dependencyStoreMocks "github.com/jaegertracing/jaeger/storage_v2/depstore/mocks"
+	"github.com/jaegertracing/jaeger/storage_v2/v1adapter"
 )
 
 var (
-	matchContext = mock.AnythingOfType("*context.valueCtx")
-	matchTraceID = mock.AnythingOfType("model.TraceID")
+	matchContext            = mock.AnythingOfType("*context.valueCtx")
+	matchGetTraceParameters = mock.AnythingOfType("spanstore.GetTraceParameters")
 
 	mockInvalidTraceID = "xyz"
 	mockTraceID        = model.NewTraceID(0, 123456)
@@ -55,11 +56,12 @@ type testServer struct {
 
 func newTestServer(t *testing.T) *testServer {
 	spanReader := &spanstoremocks.Reader{}
+	traceReader := v1adapter.NewTraceReader(spanReader)
 	metricsReader, err := disabled.NewMetricsReader()
 	require.NoError(t, err)
 
 	q := querysvc.NewQueryService(
-		spanReader,
+		traceReader,
 		&dependencyStoreMocks.Reader{},
 		querysvc.QueryServiceOptions{},
 	)
@@ -106,7 +108,7 @@ func TestQueryTrace(t *testing.T) {
 	defer q.Close()
 
 	t.Run("No error", func(t *testing.T) {
-		s.spanReader.On("GetTrace", matchContext, matchTraceID).Return(
+		s.spanReader.On("GetTrace", matchContext, matchGetTraceParameters).Return(
 			mockTraceGRPC, nil).Once()
 
 		spans, err := q.QueryTrace(mockTraceID.String())
@@ -120,7 +122,7 @@ func TestQueryTrace(t *testing.T) {
 	})
 
 	t.Run("Trace not found", func(t *testing.T) {
-		s.spanReader.On("GetTrace", matchContext, matchTraceID).Return(
+		s.spanReader.On("GetTrace", matchContext, matchGetTraceParameters).Return(
 			nil, spanstore.ErrTraceNotFound).Once()
 
 		spans, err := q.QueryTrace(mockTraceID.String())

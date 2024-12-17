@@ -22,7 +22,6 @@ import (
 	"github.com/jaegertracing/jaeger/cmd/query/app/internal/api_v3"
 	"github.com/jaegertracing/jaeger/model"
 	_ "github.com/jaegertracing/jaeger/pkg/gogocodec" // force gogo codec registration
-	"github.com/jaegertracing/jaeger/pkg/tenancy"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
 	spanstoremocks "github.com/jaegertracing/jaeger/storage/spanstore/mocks"
 )
@@ -81,8 +80,9 @@ func parseResponse(t *testing.T, body []byte, obj gogoproto.Message) {
 	require.NoError(t, gogojsonpb.Unmarshal(bytes.NewBuffer(body), obj))
 }
 
-func makeTestTrace() (*model.Trace, model.TraceID) {
+func makeTestTrace() (*model.Trace, spanstore.GetTraceParameters) {
 	traceID := model.NewTraceID(150, 160)
+	query := spanstore.GetTraceParameters{TraceID: traceID}
 	return &model.Trace{
 		Spans: []*model.Span{
 			{
@@ -95,16 +95,15 @@ func makeTestTrace() (*model.Trace, model.TraceID) {
 				},
 			},
 		},
-	}, traceID
+	}, query
 }
 
 func runGatewayTests(
 	t *testing.T,
 	basePath string,
-	tenancyOptions tenancy.Options,
 	setupRequest func(*http.Request),
 ) {
-	gw := setupHTTPGateway(t, basePath, tenancyOptions)
+	gw := setupHTTPGateway(t, basePath)
 	gw.setupRequest = setupRequest
 	t.Run("GetServices", gw.runGatewayGetServices)
 	t.Run("GetOperations", gw.runGatewayGetOperations)
@@ -142,18 +141,18 @@ func (gw *testGateway) runGatewayGetOperations(t *testing.T) {
 }
 
 func (gw *testGateway) runGatewayGetTrace(t *testing.T) {
-	trace, traceID := makeTestTrace()
-	gw.reader.On("GetTrace", matchContext, traceID).Return(trace, nil).Once()
-	gw.getTracesAndVerify(t, "/api/v3/traces/"+traceID.String(), traceID)
+	trace, query := makeTestTrace()
+	gw.reader.On("GetTrace", matchContext, query).Return(trace, nil).Once()
+	gw.getTracesAndVerify(t, "/api/v3/traces/"+query.TraceID.String(), query.TraceID)
 }
 
 func (gw *testGateway) runGatewayFindTraces(t *testing.T) {
-	trace, traceID := makeTestTrace()
+	trace, query := makeTestTrace()
 	q, qp := mockFindQueries()
 	gw.reader.
 		On("FindTraces", matchContext, qp).
 		Return([]*model.Trace{trace}, nil).Once()
-	gw.getTracesAndVerify(t, "/api/v3/traces?"+q.Encode(), traceID)
+	gw.getTracesAndVerify(t, "/api/v3/traces?"+q.Encode(), query.TraceID)
 }
 
 func (gw *testGateway) getTracesAndVerify(t *testing.T, url string, expectedTraceID model.TraceID) {

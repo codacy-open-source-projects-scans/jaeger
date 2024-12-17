@@ -14,6 +14,7 @@ import (
 	cascfg "github.com/jaegertracing/jaeger/pkg/cassandra/config"
 	"github.com/jaegertracing/jaeger/pkg/jtracer"
 	"github.com/jaegertracing/jaeger/pkg/metrics"
+	"github.com/jaegertracing/jaeger/plugin/storage/cassandra"
 	cSpanStore "github.com/jaegertracing/jaeger/plugin/storage/cassandra/spanstore"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
 )
@@ -36,7 +37,7 @@ func main() {
 			Timeout: time.Millisecond * 750,
 		},
 	}
-	cqlSession, err := cConfig.NewSession()
+	cqlSession, err := cassandra.NewSession(cConfig)
 	if err != nil {
 		logger.Fatal("Cannot create Cassandra session", zap.Error(err))
 	}
@@ -59,7 +60,7 @@ func main() {
 		logger.Info("Saved span", zap.String("spanID", getSomeSpan().SpanID.String()))
 	}
 	s := getSomeSpan()
-	trace, err := spanReader.GetTrace(ctx, s.TraceID)
+	trace, err := spanReader.GetTrace(ctx, spanstore.GetTraceParameters{TraceID: s.TraceID})
 	if err != nil {
 		logger.Fatal("Failed to read", zap.Error(err))
 	} else {

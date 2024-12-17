@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/viper"
 	"go.opentelemetry.io/collector/config/configgrpc"
 	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/confignet"
 	"go.opentelemetry.io/collector/config/configopaque"
 	"go.uber.org/zap"
 
@@ -100,6 +101,11 @@ func AddFlags(flagSet *flag.FlagSet) {
 func (qOpts *QueryOptions) InitFromViper(v *viper.Viper, logger *zap.Logger) (*QueryOptions, error) {
 	qOpts.HTTP.Endpoint = v.GetString(queryHTTPHostPort)
 	qOpts.GRPC.NetAddr.Endpoint = v.GetString(queryGRPCHostPort)
+	// TODO: drop support for same host ports
+	// https://github.com/jaegertracing/jaeger/issues/6117
+	if qOpts.HTTP.Endpoint == qOpts.GRPC.NetAddr.Endpoint {
+		logger.Warn("using the same port for gRPC and HTTP is deprecated; please use dedicated ports instead; support for shared ports will be removed in Feb 2025")
+	}
 	tlsGrpc, err := tlsGRPCFlagsConfig.InitFromViper(v)
 	if err != nil {
 		return qOpts, fmt.Errorf("failed to process gRPC TLS options: %w", err)
@@ -130,7 +136,7 @@ func (qOpts *QueryOptions) InitFromViper(v *viper.Viper, logger *zap.Logger) (*Q
 }
 
 // BuildQueryServiceOptions creates a QueryServiceOptions struct with appropriate adjusters and archive config
-func (qOpts *QueryOptions) BuildQueryServiceOptions(storageFactory storage.Factory, logger *zap.Logger) *querysvc.QueryServiceOptions {
+func (qOpts *QueryOptions) BuildQueryServiceOptions(storageFactory storage.BaseFactory, logger *zap.Logger) *querysvc.QueryServiceOptions {
 	opts := &querysvc.QueryServiceOptions{}
 	if !opts.InitArchiveStorage(storageFactory, logger) {
 		logger.Info("Archive storage not initialized")
@@ -155,7 +161,7 @@ func stringSliceAsHeader(slice []string) (http.Header, error) {
 
 	header, err := tp.ReadMIMEHeader()
 	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("failed to parse headers")
+		return nil, errors.New("failed to parse headers")
 	}
 
 	return http.Header(header), nil
@@ -168,4 +174,18 @@ func mapHTTPHeaderToOTELHeaders(h http.Header) map[string]configopaque.String {
 	}
 
 	return otelHeaders
+}
+
+func DefaultQueryOptions() QueryOptions {
+	return QueryOptions{
+		HTTP: confighttp.ServerConfig{
+			Endpoint: ports.PortToHostPort(ports.QueryHTTP),
+		},
+		GRPC: configgrpc.ServerConfig{
+			NetAddr: confignet.AddrConfig{
+				Endpoint:  ports.PortToHostPort(ports.QueryGRPC),
+				Transport: confignet.TransportTypeTCP,
+			},
+		},
+	}
 }

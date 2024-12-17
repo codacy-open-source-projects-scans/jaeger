@@ -18,7 +18,6 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/gorilla/mux"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
@@ -27,10 +26,9 @@ import (
 	uiconv "github.com/jaegertracing/jaeger/model/converter/json"
 	ui "github.com/jaegertracing/jaeger/model/json"
 	"github.com/jaegertracing/jaeger/pkg/jtracer"
-	"github.com/jaegertracing/jaeger/pkg/tenancy"
-	"github.com/jaegertracing/jaeger/plugin/metrics/disabled"
+	"github.com/jaegertracing/jaeger/plugin/metricstore/disabled"
 	"github.com/jaegertracing/jaeger/proto-gen/api_v2/metrics"
-	"github.com/jaegertracing/jaeger/storage/metricsstore"
+	"github.com/jaegertracing/jaeger/storage/metricstore"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
 )
 
@@ -76,7 +74,6 @@ type APIHandler struct {
 	queryService        *querysvc.QueryService
 	metricsQueryService querysvc.MetricsQueryService
 	queryParser         queryParser
-	tenancyMgr          *tenancy.Manager
 	basePath            string
 	apiPrefix           string
 	logger              *zap.Logger
@@ -84,14 +81,13 @@ type APIHandler struct {
 }
 
 // NewAPIHandler returns an APIHandler
-func NewAPIHandler(queryService *querysvc.QueryService, tm *tenancy.Manager, options ...HandlerOption) *APIHandler {
+func NewAPIHandler(queryService *querysvc.QueryService, options ...HandlerOption) *APIHandler {
 	aH := &APIHandler{
 		queryService: queryService,
 		queryParser: queryParser{
 			traceQueryLookbackDuration: defaultTraceQueryLookbackDuration,
 			timeNow:                    time.Now,
 		},
-		tenancyMgr: tm,
 	}
 
 	for _, option := range options {
@@ -135,14 +131,9 @@ func (aH *APIHandler) handleFunc(
 ) *mux.Route {
 	route := aH.formatRoute(routeFmt, args...)
 	var handler http.Handler = http.HandlerFunc(f)
-	if aH.tenancyMgr.Enabled {
-		handler = tenancy.ExtractTenantHTTPHandler(aH.tenancyMgr, handler)
-	}
-	traceMiddleware := otelhttp.NewHandler(
-		otelhttp.WithRouteTag(route, traceResponseHandler(handler)),
-		route,
-		otelhttp.WithTracerProvider(aH.tracer))
-	return router.HandleFunc(route, traceMiddleware.ServeHTTP)
+	handler = otelhttp.WithRouteTag(route, handler)
+	handler = spanNameHandler(route, handler)
+	return router.HandleFunc(route, handler.ServeHTTP)
 }
 
 func (aH *APIHandler) formatRoute(route string, args ...any) string {
@@ -275,7 +266,11 @@ func (aH *APIHandler) tracesByIDs(ctx context.Context, traceIDs []model.TraceID)
 	var traceErrors []structuredError
 	retMe := make([]*model.Trace, 0, len(traceIDs))
 	for _, traceID := range traceIDs {
-		if trace, err := aH.queryService.GetTrace(ctx, traceID); err != nil {
+		// TODO: add start time & end time
+		query := spanstore.GetTraceParameters{
+			TraceID: traceID,
+		}
+		if trc, err := aH.queryService.GetTrace(ctx, query); err != nil {
 			if !errors.Is(err, spanstore.ErrTraceNotFound) {
 				return nil, nil, err
 			}
@@ -284,7 +279,7 @@ func (aH *APIHandler) tracesByIDs(ctx context.Context, traceIDs []model.TraceID)
 				TraceID: ui.TraceID(traceID.String()),
 			})
 		} else {
-			retMe = append(retMe, trace)
+			retMe = append(retMe, trc)
 		}
 	}
 	return retMe, traceErrors, nil
@@ -315,8 +310,8 @@ func (aH *APIHandler) latencies(w http.ResponseWriter, r *http.Request) {
 		aH.handleError(w, newParseError(err, quantileParam), http.StatusBadRequest)
 		return
 	}
-	aH.metrics(w, r, func(ctx context.Context, baseParams metricsstore.BaseQueryParameters) (*metrics.MetricFamily, error) {
-		return aH.metricsQueryService.GetLatencies(ctx, &metricsstore.LatenciesQueryParameters{
+	aH.metrics(w, r, func(ctx context.Context, baseParams metricstore.BaseQueryParameters) (*metrics.MetricFamily, error) {
+		return aH.metricsQueryService.GetLatencies(ctx, &metricstore.LatenciesQueryParameters{
 			BaseQueryParameters: baseParams,
 			Quantile:            q,
 		})
@@ -324,23 +319,23 @@ func (aH *APIHandler) latencies(w http.ResponseWriter, r *http.Request) {
 }
 
 func (aH *APIHandler) calls(w http.ResponseWriter, r *http.Request) {
-	aH.metrics(w, r, func(ctx context.Context, baseParams metricsstore.BaseQueryParameters) (*metrics.MetricFamily, error) {
-		return aH.metricsQueryService.GetCallRates(ctx, &metricsstore.CallRateQueryParameters{
+	aH.metrics(w, r, func(ctx context.Context, baseParams metricstore.BaseQueryParameters) (*metrics.MetricFamily, error) {
+		return aH.metricsQueryService.GetCallRates(ctx, &metricstore.CallRateQueryParameters{
 			BaseQueryParameters: baseParams,
 		})
 	})
 }
 
 func (aH *APIHandler) errors(w http.ResponseWriter, r *http.Request) {
-	aH.metrics(w, r, func(ctx context.Context, baseParams metricsstore.BaseQueryParameters) (*metrics.MetricFamily, error) {
-		return aH.metricsQueryService.GetErrorRates(ctx, &metricsstore.ErrorRateQueryParameters{
+	aH.metrics(w, r, func(ctx context.Context, baseParams metricstore.BaseQueryParameters) (*metrics.MetricFamily, error) {
+		return aH.metricsQueryService.GetErrorRates(ctx, &metricstore.ErrorRateQueryParameters{
 			BaseQueryParameters: baseParams,
 		})
 	})
 }
 
 func (aH *APIHandler) minStep(w http.ResponseWriter, r *http.Request) {
-	minStep, err := aH.metricsQueryService.GetMinStepDuration(r.Context(), &metricsstore.MinStepDurationQueryParameters{})
+	minStep, err := aH.metricsQueryService.GetMinStepDuration(r.Context(), &metricstore.MinStepDurationQueryParameters{})
 	if aH.handleError(w, err, http.StatusInternalServerError) {
 		return
 	}
@@ -351,7 +346,7 @@ func (aH *APIHandler) minStep(w http.ResponseWriter, r *http.Request) {
 	aH.writeJSON(w, r, &structuredRes)
 }
 
-func (aH *APIHandler) metrics(w http.ResponseWriter, r *http.Request, getMetrics func(context.Context, metricsstore.BaseQueryParameters) (*metrics.MetricFamily, error)) {
+func (aH *APIHandler) metrics(w http.ResponseWriter, r *http.Request, getMetrics func(context.Context, metricstore.BaseQueryParameters) (*metrics.MetricFamily, error)) {
 	requestParams, err := aH.queryParser.parseMetricsQueryParams(r)
 	if aH.handleError(w, err, http.StatusBadRequest) {
 		return
@@ -363,16 +358,16 @@ func (aH *APIHandler) metrics(w http.ResponseWriter, r *http.Request, getMetrics
 	aH.writeJSON(w, r, m)
 }
 
-func (aH *APIHandler) convertModelToUI(trace *model.Trace, adjust bool) (*ui.Trace, *structuredError) {
+func (aH *APIHandler) convertModelToUI(trc *model.Trace, adjust bool) (*ui.Trace, *structuredError) {
 	var errs []error
 	if adjust {
 		var err error
-		trace, err = aH.queryService.Adjust(trace)
+		trc, err = aH.queryService.Adjust(trc)
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
-	uiTrace := uiconv.FromDomain(trace)
+	uiTrace := uiconv.FromDomain(trc)
 	var uiError *structuredError
 	if err := errors.Join(errs...); err != nil {
 		uiError = &structuredError{
@@ -438,7 +433,11 @@ func (aH *APIHandler) getTrace(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	trace, err := aH.queryService.GetTrace(r.Context(), traceID)
+	// TODO: add start time & end time
+	query := spanstore.GetTraceParameters{
+		TraceID: traceID,
+	}
+	trc, err := aH.queryService.GetTrace(r.Context(), query)
 	if errors.Is(err, spanstore.ErrTraceNotFound) {
 		aH.handleError(w, err, http.StatusNotFound)
 		return
@@ -448,7 +447,7 @@ func (aH *APIHandler) getTrace(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var uiErrors []structuredError
-	structuredRes := aH.tracesToResponse([]*model.Trace{trace}, shouldAdjust(r), uiErrors)
+	structuredRes := aH.tracesToResponse([]*model.Trace{trc}, shouldAdjust(r), uiErrors)
 	aH.writeJSON(w, r, structuredRes)
 }
 
@@ -467,7 +466,11 @@ func (aH *APIHandler) archiveTrace(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// QueryService.ArchiveTrace can now archive this traceID.
-	err := aH.queryService.ArchiveTrace(r.Context(), traceID)
+	// TODO: add start time & end time
+	query := spanstore.GetTraceParameters{
+		TraceID: traceID,
+	}
+	err := aH.queryService.ArchiveTrace(r.Context(), query)
 	if errors.Is(err, spanstore.ErrTraceNotFound) {
 		aH.handleError(w, err, http.StatusNotFound)
 		return
@@ -524,17 +527,10 @@ func (aH *APIHandler) writeJSON(w http.ResponseWriter, r *http.Request, response
 	}
 }
 
-// Returns a handler that generates a traceresponse header.
-// https://github.com/w3c/trace-context/blob/main/spec/21-http_response_header_format.md
-func traceResponseHandler(handler http.Handler) http.Handler {
-	// We use the standard TraceContext propagator, since the formats are identical.
-	// But the propagator uses "traceparent" header name, so we inject it into a map
-	// `carrier` and then use the result to set the "tracereponse" header.
-	var prop propagation.TraceContext
+func spanNameHandler(spanName string, handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		carrier := make(map[string]string)
-		prop.Inject(r.Context(), propagation.MapCarrier(carrier))
-		w.Header().Add("traceresponse", carrier["traceparent"])
+		span := trace.SpanFromContext(r.Context())
+		span.SetName(spanName)
 		handler.ServeHTTP(w, r)
 	})
 }

@@ -144,7 +144,10 @@ func (s *StorageIntegration) testGetServices(t *testing.T) {
 	found := s.waitForCondition(t, func(t *testing.T) bool {
 		var err error
 		actual, err = s.SpanReader.GetServices(context.Background())
-		require.NoError(t, err)
+		if err != nil {
+			t.Log(err)
+			return false
+		}
 		sort.Strings(actual)
 		t.Logf("Retrieved services: %v", actual)
 		if len(actual) > len(expected) {
@@ -195,7 +198,7 @@ func (s *StorageIntegration) testArchiveTrace(t *testing.T) {
 	var actual *model.Trace
 	found := s.waitForCondition(t, func(_ *testing.T) bool {
 		var err error
-		actual, err = s.ArchiveSpanReader.GetTrace(context.Background(), tID)
+		actual, err = s.ArchiveSpanReader.GetTrace(context.Background(), spanstore.GetTraceParameters{TraceID: tID})
 		return err == nil && len(actual.Spans) == 1
 	})
 	require.True(t, found)
@@ -206,19 +209,33 @@ func (s *StorageIntegration) testGetLargeSpan(t *testing.T) {
 	s.skipIfNeeded(t)
 	defer s.cleanUp(t)
 
-	t.Log("Testing Large Trace over 10K ...")
-	expected := s.loadParseAndWriteLargeTrace(t)
+	t.Log("Testing Large Trace over 10K with duplicate IDs...")
+
+	expected := s.writeLargeTraceWithDuplicateSpanIds(t)
 	expectedTraceID := expected.Spans[0].TraceID
 
 	var actual *model.Trace
 	found := s.waitForCondition(t, func(_ *testing.T) bool {
 		var err error
-		actual, err = s.SpanReader.GetTrace(context.Background(), expectedTraceID)
+		actual, err = s.SpanReader.GetTrace(context.Background(), spanstore.GetTraceParameters{TraceID: expectedTraceID})
 		return err == nil && len(actual.Spans) >= len(expected.Spans)
 	})
+
 	if !assert.True(t, found) {
 		CompareTraces(t, expected, actual)
+		return
 	}
+
+	duplicateCount := 0
+	seenIDs := make(map[model.SpanID]int)
+
+	for _, span := range actual.Spans {
+		seenIDs[span.SpanID]++
+		if seenIDs[span.SpanID] > 1 {
+			duplicateCount++
+		}
+	}
+	assert.Positive(t, duplicateCount, "Duplicate SpanIDs should be present in the trace")
 }
 
 func (s *StorageIntegration) testGetOperations(t *testing.T) {
@@ -246,7 +263,10 @@ func (s *StorageIntegration) testGetOperations(t *testing.T) {
 		var err error
 		actual, err = s.SpanReader.GetOperations(context.Background(),
 			spanstore.OperationQueryParameters{ServiceName: "example-service-1"})
-		require.NoError(t, err)
+		if err != nil {
+			t.Log(err)
+			return false
+		}
 		sort.Slice(actual, func(i, j int) bool {
 			return actual[i].Name < actual[j].Name
 		})
@@ -270,7 +290,7 @@ func (s *StorageIntegration) testGetTrace(t *testing.T) {
 	var actual *model.Trace
 	found := s.waitForCondition(t, func(t *testing.T) bool {
 		var err error
-		actual, err = s.SpanReader.GetTrace(context.Background(), expectedTraceID)
+		actual, err = s.SpanReader.GetTrace(context.Background(), spanstore.GetTraceParameters{TraceID: expectedTraceID})
 		if err != nil {
 			t.Log(err)
 		}
@@ -282,7 +302,7 @@ func (s *StorageIntegration) testGetTrace(t *testing.T) {
 
 	t.Run("NotFound error", func(t *testing.T) {
 		fakeTraceID := model.TraceID{High: 0, Low: 1}
-		trace, err := s.SpanReader.GetTrace(context.Background(), fakeTraceID)
+		trace, err := s.SpanReader.GetTrace(context.Background(), spanstore.GetTraceParameters{TraceID: fakeTraceID})
 		assert.Equal(t, spanstore.ErrTraceNotFound, err)
 		assert.Nil(t, trace)
 	})
@@ -327,7 +347,10 @@ func (s *StorageIntegration) findTracesByQuery(t *testing.T, query *spanstore.Tr
 	found := s.waitForCondition(t, func(t *testing.T) bool {
 		var err error
 		traces, err = s.SpanReader.FindTraces(context.Background(), query)
-		require.NoError(t, err)
+		if err != nil {
+			t.Log(err)
+			return false
+		}
 		if len(expected) != len(traces) {
 			t.Logf("Expecting certain number of traces: expected: %d, actual: %d", len(expected), len(traces))
 			return false
@@ -356,19 +379,21 @@ func (s *StorageIntegration) loadParseAndWriteExampleTrace(t *testing.T) *model.
 	return trace
 }
 
-func (s *StorageIntegration) loadParseAndWriteLargeTrace(t *testing.T) *model.Trace {
+func (s *StorageIntegration) writeLargeTraceWithDuplicateSpanIds(t *testing.T) *model.Trace {
 	trace := s.getTraceFixture(t, "example_trace")
-	span := trace.Spans[0]
-	spns := make([]*model.Span, 1, 10008)
-	trace.Spans = spns
-	trace.Spans[0] = span
-	for i := 1; i < 10008; i++ {
-		s := new(model.Span)
-		*s = *span
-		//nolint: gosec // G115
-		s.SpanID = model.SpanID(i)
-		s.StartTime = s.StartTime.Add(time.Second * time.Duration(i+1))
-		trace.Spans = append(trace.Spans, s)
+	repeatedSpan := trace.Spans[0]
+	trace.Spans = make([]*model.Span, 0, 10008)
+	for i := 0; i < 10008; i++ {
+		newSpan := new(model.Span)
+		*newSpan = *repeatedSpan
+		switch {
+		case i%100 == 0:
+			newSpan.SpanID = repeatedSpan.SpanID
+		default:
+			newSpan.SpanID = model.SpanID(i)
+		}
+		newSpan.StartTime = newSpan.StartTime.Add(time.Second * time.Duration(i+1))
+		trace.Spans = append(trace.Spans, newSpan)
 	}
 	s.writeTrace(t, trace)
 	return trace
@@ -409,8 +434,8 @@ func loadAndParseJSON(t *testing.T, path string, object any) {
 }
 
 // required, because we want to only query on recent traces, so we replace all the dates with recent dates.
-func correctTime(json []byte) []byte {
-	jsonString := string(json)
+func correctTime(jsonData []byte) []byte {
+	jsonString := string(jsonData)
 	now := time.Now().UTC()
 	yesterday := now.AddDate(0, 0, -1).Format("2006-01-02")
 	twoDaysAgo := now.AddDate(0, 0, -2).Format("2006-01-02")
@@ -464,7 +489,10 @@ func (s *StorageIntegration) testGetDependencies(t *testing.T) {
 	found := s.waitForCondition(t, func(t *testing.T) bool {
 		var err error
 		actual, err = s.DependencyReader.GetDependencies(context.Background(), time.Now(), 5*time.Minute)
-		require.NoError(t, err)
+		if err != nil {
+			t.Log(err)
+			return false
+		}
 		sort.Slice(actual, func(i, j int) bool {
 			return actual[i].Parent < actual[j].Parent
 		})
@@ -495,7 +523,10 @@ func (s *StorageIntegration) testGetThroughput(t *testing.T) {
 	_ = s.waitForCondition(t, func(t *testing.T) bool {
 		var err error
 		actual, err = s.SamplingStore.GetThroughput(start, start.Add(time.Second*time.Duration(10)))
-		require.NoError(t, err)
+		if err != nil {
+			t.Log(err)
+			return false
+		}
 		return assert.ObjectsAreEqualValues(expected, len(actual))
 	})
 	assert.Len(t, actual, expected)
@@ -517,7 +548,10 @@ func (s *StorageIntegration) testGetLatestProbability(t *testing.T) {
 	found := s.waitForCondition(t, func(t *testing.T) bool {
 		var err error
 		actual, err = s.SamplingStore.GetLatestProbabilities()
-		require.NoError(t, err)
+		if err != nil {
+			t.Log(err)
+			return false
+		}
 		return assert.ObjectsAreEqualValues(expected, actual)
 	})
 	if !assert.True(t, found) {

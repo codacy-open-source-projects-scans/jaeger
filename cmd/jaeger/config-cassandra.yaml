@@ -5,6 +5,16 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [jaeger_storage_exporter]
+  telemetry:
+    resource:
+      service.name: jaeger
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888
+    logs:
+      level: debug
+    # TODO Initialize telemetry tracer once OTEL released new feature.
+    # https://github.com/open-telemetry/opentelemetry-collector/issues/10663
 
 extensions:
   healthcheckv2:
@@ -24,6 +34,7 @@ extensions:
         cassandra:
           schema: 
             keyspace: "jaeger_v1_dc1"
+            create: "${env:CASSANDRA_CREATE_SCHEMA:-true}"
           connection:
             auth: 
               basic:
@@ -34,7 +45,8 @@ extensions:
       another_storage:
         cassandra:
           schema: 
-            keyspace: "jaeger_v1_dc1"
+            keyspace: "jaeger_v1_dc1_archive"
+            create: "${env:CASSANDRA_CREATE_SCHEMA:-true}"
           connection: 
             auth:
               basic: 

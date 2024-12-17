@@ -5,6 +5,12 @@ dir: "{{.InterfaceDir}}/mocks/"
 mockname: "{{.InterfaceName}}"
 filename: "{{.InterfaceName}}.go"
 boilerplate-file: .mockery.header.txt
+
+# Flags for future v3 compatibility.
+# See https://github.com/vektra/mockery/issues/848
+issue-845-fix: true
+resolve-type-alias: false
+
 packages:
   github.com/jaegertracing/jaeger/cmd/collector/app/sanitizer/cache:
     interfaces:
@@ -58,12 +64,18 @@ packages:
   github.com/jaegertracing/jaeger/storage/dependencystore:
     interfaces:
       Reader:
-  github.com/jaegertracing/jaeger/storage/metricsstore:
+  github.com/jaegertracing/jaeger/storage/metricstore:
     config:
       all: true
   github.com/jaegertracing/jaeger/storage/samplingstore:
     config:
       all: true
   github.com/jaegertracing/jaeger/storage/spanstore:
+    config:
+      all: true
+  github.com/jaegertracing/jaeger/storage_v2/tracestore:
+    config:
+      all: true
+  github.com/jaegertracing/jaeger/storage_v2/depstore:
     config:
       all: true

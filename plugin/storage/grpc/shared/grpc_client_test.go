@@ -15,11 +15,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/jaegertracing/jaeger/model"
-	"github.com/jaegertracing/jaeger/pkg/bearertoken"
 	"github.com/jaegertracing/jaeger/proto-gen/storage_v1"
 	grpcMocks "github.com/jaegertracing/jaeger/proto-gen/storage_v1/mocks"
 	"github.com/jaegertracing/jaeger/storage/spanstore"
@@ -104,7 +102,7 @@ func withGRPCClient(fn func(r *grpcClientTest)) {
 
 func TestNewGRPCClient(t *testing.T) {
 	conn := &grpc.ClientConn{}
-	client := NewGRPCClient(conn)
+	client := NewGRPCClient(conn, conn)
 	assert.NotNil(t, client)
 
 	assert.Implements(t, (*storage_v1.SpanReaderPluginClient)(nil), client.readerClient)
@@ -114,22 +112,6 @@ func TestNewGRPCClient(t *testing.T) {
 	assert.Implements(t, (*storage_v1.PluginCapabilitiesClient)(nil), client.capabilitiesClient)
 	assert.Implements(t, (*storage_v1.DependenciesReaderPluginClient)(nil), client.depsReaderClient)
 	assert.Implements(t, (*storage_v1.StreamingSpanWriterPluginClient)(nil), client.streamWriterClient)
-}
-
-func TestContextUpgradeWithToken(t *testing.T) {
-	testBearerToken := "test-bearer-token"
-	ctx := bearertoken.ContextWithBearerToken(context.Background(), testBearerToken)
-	upgradedToken := upgradeContextWithBearerToken(ctx)
-	md, ok := metadata.FromOutgoingContext(upgradedToken)
-	assert.Truef(t, ok, "Expected metadata in context")
-	bearerTokenFromMetadata := md.Get(BearerTokenKey)
-	assert.Equal(t, []string{testBearerToken}, bearerTokenFromMetadata)
-}
-
-func TestContextUpgradeWithoutToken(t *testing.T) {
-	upgradedToken := upgradeContextWithBearerToken(context.Background())
-	_, ok := metadata.FromOutgoingContext(upgradedToken)
-	assert.Falsef(t, ok, "Expected no metadata in context")
 }
 
 func TestGRPCClientGetServices(t *testing.T) {
@@ -175,13 +157,17 @@ func TestGRPCClientGetOperationsV2(t *testing.T) {
 
 func TestGRPCClientGetTrace(t *testing.T) {
 	withGRPCClient(func(r *grpcClientTest) {
+		startTime := time.Date(2020, time.January, 1, 13, 0, 0, 0, time.UTC)
+		endTime := time.Date(2020, time.January, 1, 14, 0, 0, 0, time.UTC)
 		traceClient := new(grpcMocks.SpanReaderPlugin_GetTraceClient)
 		traceClient.On("Recv").Return(&storage_v1.SpansResponseChunk{
 			Spans: mockTraceSpans,
 		}, nil).Once()
 		traceClient.On("Recv").Return(nil, io.EOF)
 		r.spanReader.On("GetTrace", mock.Anything, &storage_v1.GetTraceRequest{
-			TraceID: mockTraceID,
+			TraceID:   mockTraceID,
+			StartTime: startTime,
+			EndTime:   endTime,
 		}).Return(traceClient, nil)
 
 		var expectedSpans []*model.Span
@@ -189,7 +175,11 @@ func TestGRPCClientGetTrace(t *testing.T) {
 			expectedSpans = append(expectedSpans, &mockTraceSpans[i])
 		}
 
-		s, err := r.client.GetTrace(context.Background(), mockTraceID)
+		s, err := r.client.GetTrace(context.Background(), spanstore.GetTraceParameters{
+			TraceID:   mockTraceID,
+			StartTime: startTime,
+			EndTime:   endTime,
+		})
 		require.NoError(t, err)
 		assert.Equal(t, &model.Trace{
 			Spans: expectedSpans,
@@ -205,7 +195,7 @@ func TestGRPCClientGetTrace_StreamError(t *testing.T) {
 			TraceID: mockTraceID,
 		}).Return(traceClient, nil)
 
-		s, err := r.client.GetTrace(context.Background(), mockTraceID)
+		s, err := r.client.GetTrace(context.Background(), spanstore.GetTraceParameters{TraceID: mockTraceID})
 		require.Error(t, err)
 		assert.Nil(t, s)
 	})
@@ -217,7 +207,7 @@ func TestGRPCClientGetTrace_NoTrace(t *testing.T) {
 			TraceID: mockTraceID,
 		}).Return(nil, status.Errorf(codes.NotFound, ""))
 
-		s, err := r.client.GetTrace(context.Background(), mockTraceID)
+		s, err := r.client.GetTrace(context.Background(), spanstore.GetTraceParameters{TraceID: mockTraceID})
 		assert.Equal(t, spanstore.ErrTraceNotFound, err)
 		assert.Nil(t, s)
 	})
@@ -233,7 +223,7 @@ func TestGRPCClientGetTrace_StreamErrorTraceNotFound(t *testing.T) {
 			TraceID: mockTraceID,
 		}).Return(traceClient, nil)
 
-		s, err := r.client.GetTrace(context.Background(), mockTraceID)
+		s, err := r.client.GetTrace(context.Background(), spanstore.GetTraceParameters{TraceID: mockTraceID})
 		assert.Equal(t, spanstore.ErrTraceNotFound, err)
 		assert.Nil(t, s)
 	})
@@ -382,13 +372,17 @@ func TestGrpcClientStreamWriterWriteSpan(t *testing.T) {
 
 func TestGrpcClientGetArchiveTrace(t *testing.T) {
 	withGRPCClient(func(r *grpcClientTest) {
+		startTime := time.Date(2020, time.January, 1, 13, 0, 0, 0, time.UTC)
+		endTime := time.Date(2020, time.January, 1, 14, 0, 0, 0, time.UTC)
 		traceClient := new(grpcMocks.ArchiveSpanReaderPlugin_GetArchiveTraceClient)
 		traceClient.On("Recv").Return(&storage_v1.SpansResponseChunk{
 			Spans: mockTraceSpans,
 		}, nil).Once()
 		traceClient.On("Recv").Return(nil, io.EOF)
 		r.archiveReader.On("GetArchiveTrace", mock.Anything, &storage_v1.GetTraceRequest{
-			TraceID: mockTraceID,
+			TraceID:   mockTraceID,
+			StartTime: startTime,
+			EndTime:   endTime,
 		}).Return(traceClient, nil)
 
 		var expectedSpans []*model.Span
@@ -396,7 +390,11 @@ func TestGrpcClientGetArchiveTrace(t *testing.T) {
 			expectedSpans = append(expectedSpans, &mockTraceSpans[i])
 		}
 
-		s, err := r.client.ArchiveSpanReader().GetTrace(context.Background(), mockTraceID)
+		s, err := r.client.ArchiveSpanReader().GetTrace(context.Background(), spanstore.GetTraceParameters{
+			TraceID:   mockTraceID,
+			StartTime: startTime,
+			EndTime:   endTime,
+		})
 		require.NoError(t, err)
 		assert.Equal(t, &model.Trace{
 			Spans: expectedSpans,
@@ -412,7 +410,9 @@ func TestGrpcClientGetArchiveTrace_StreamError(t *testing.T) {
 			TraceID: mockTraceID,
 		}).Return(traceClient, nil)
 
-		s, err := r.client.ArchiveSpanReader().GetTrace(context.Background(), mockTraceID)
+		s, err := r.client.ArchiveSpanReader().GetTrace(context.Background(), spanstore.GetTraceParameters{
+			TraceID: mockTraceID,
+		})
 		require.Error(t, err)
 		assert.Nil(t, s)
 	})
@@ -424,7 +424,12 @@ func TestGrpcClientGetArchiveTrace_NoTrace(t *testing.T) {
 			TraceID: mockTraceID,
 		}).Return(nil, spanstore.ErrTraceNotFound)
 
-		s, err := r.client.ArchiveSpanReader().GetTrace(context.Background(), mockTraceID)
+		s, err := r.client.ArchiveSpanReader().GetTrace(
+			context.Background(),
+			spanstore.GetTraceParameters{
+				TraceID: mockTraceID,
+			},
+		)
 		require.Error(t, err)
 		assert.Nil(t, s)
 	})
@@ -438,7 +443,9 @@ func TestGrpcClientGetArchiveTrace_StreamErrorTraceNotFound(t *testing.T) {
 			TraceID: mockTraceID,
 		}).Return(traceClient, nil)
 
-		s, err := r.client.ArchiveSpanReader().GetTrace(context.Background(), mockTraceID)
+		s, err := r.client.ArchiveSpanReader().GetTrace(context.Background(), spanstore.GetTraceParameters{
+			TraceID: mockTraceID,
+		})
 		assert.Equal(t, spanstore.ErrTraceNotFound, err)
 		assert.Nil(t, s)
 	})
