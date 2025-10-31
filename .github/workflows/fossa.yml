@@ -1,0 +1,46 @@
+name: FOSSA
+
+on:
+  merge_group:
+  push:
+    branches: [main]
+
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event.pull_request && github.event.pull_request.number) || github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# See https://github.com/ossf/scorecard/blob/main/docs/checks.md#token-permissions
+permissions:
+  contents: read
+
+jobs:
+  fossa-license-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: 1.25.x
+
+      - name: Add GOPATH
+        run: |
+          echo "GOPATH=$(go env GOPATH)"
+          echo "GOPATH=$(go env GOPATH)" >>"$GITHUB_ENV"
+          echo "$GOPATH/bin" >>"$GITHUB_PATH"
+
+      - name: Run FOSSA scan and upload report
+        uses: fossa-contrib/fossa-action@3d2ef181b1820d6dcd1972f86a767d18167fa19b # v3.0.1
+        with:
+          # FOSSA Push-Only API Token
+          fossa-api-key: 304657e2357ba57b416b94e6b119131b
+          github-token: ${{ github.token }}
