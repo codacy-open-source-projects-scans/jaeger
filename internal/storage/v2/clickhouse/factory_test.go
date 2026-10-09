@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/config/configoptional"
-	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/config/configtls"
 
 	"github.com/jaegertracing/jaeger/internal/storage/v2/clickhouse/clickhousetest"
 	"github.com/jaegertracing/jaeger/internal/storage/v2/clickhouse/sql"
@@ -316,14 +316,35 @@ func TestGetProtocol(t *testing.T) {
 	}
 }
 
-func TestNewFactory_FeatureGateDisabled(t *testing.T) {
-	require.NoError(t, featuregate.GlobalRegistry().Set(clickhouseStorageGate.ID(), false))
-	t.Cleanup(func() {
-		require.NoError(t, featuregate.GlobalRegistry().Set(clickhouseStorageGate.ID(), true))
-	})
-	f, err := NewFactory(context.Background(), Configuration{}, telemetry.NoopSettings())
-	require.ErrorContains(t, err, "must be explicitly enabled")
+func TestNewFactory_TLSLoadError(t *testing.T) {
+	cfg := Configuration{
+		Protocol:  "native",
+		Addresses: []string{"localhost:9440"},
+		TLS: configoptional.Some(configtls.ClientConfig{
+			Config: configtls.Config{
+				CAFile: "/nonexistent/ca.pem",
+			},
+		}),
+	}
+	f, err := NewFactory(context.Background(), cfg, telemetry.NoopSettings())
+	require.ErrorContains(t, err, "failed to load TLS configuration")
 	require.Nil(t, f)
+}
+
+func TestNewFactory_TLSLoadSuccess(t *testing.T) {
+	srv := clickhousetest.NewServer(clickhousetest.FailureConfig{})
+	defer srv.Close()
+	cfg := Configuration{
+		Protocol:  "native",
+		Addresses: []string{srv.Listener.Addr().String()},
+		TLS: configoptional.Some(configtls.ClientConfig{
+			InsecureSkipVerify: true,
+		}),
+	}
+	// TLS config loads successfully; connection fails because the test server is plain (no TLS).
+	_, err := NewFactory(context.Background(), cfg, telemetry.NoopSettings())
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "failed to load TLS configuration")
 }
 
 func TestNewSchemaBuilder_Errors(t *testing.T) {
@@ -438,4 +459,22 @@ func TestCreateTraceIDTimestampsTableTemplate(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, queryWithTTL, "TTL end + INTERVAL 86400 SECOND DELETE")
 	})
+}
+
+func TestNewFactory_KeepsExplicitZeroCacheSettings(t *testing.T) {
+	srv := clickhousetest.NewServer(clickhousetest.FailureConfig{})
+	defer srv.Close()
+
+	cfg := DefaultConfiguration()
+	cfg.Protocol = "http"
+	cfg.Addresses = []string{srv.Listener.Addr().String()}
+	cfg.AttributeMetadataCacheTTL = 0
+	cfg.AttributeMetadataCacheMaxSize = 0
+
+	f, err := NewFactory(context.Background(), cfg, telemetry.NoopSettings())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, f.Close()) }()
+
+	assert.Zero(t, f.config.AttributeMetadataCacheTTL)
+	assert.Zero(t, f.config.AttributeMetadataCacheMaxSize)
 }

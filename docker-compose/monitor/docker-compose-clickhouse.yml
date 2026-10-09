@@ -1,6 +1,9 @@
+# Copyright (c) 2026 The Jaeger Authors.
+# SPDX-License-Identifier: Apache-2.0
+
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:25.12.1@sha256:7234d193fbeb3a375f21f0bb99040396f68bb2e82cada4f4947d7fcf9638bbf3
+    image: clickhouse/clickhouse-server:26.8.2@sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb
     networks:
       - backend
     environment:
@@ -24,7 +27,7 @@ services:
     volumes:
       - "./jaeger-ui.json:/etc/jaeger/jaeger-ui.json"
       - "../../cmd/jaeger/config-spm-clickhouse.yaml:/etc/jaeger/config.yml"
-    command: ["--config", "/etc/jaeger/config.yml", "--feature-gates=storage.clickhouse"]
+    command: ["--config", "/etc/jaeger/config.yml"]
     ports:
       - "16686:16686"
       - "8888:8888"

@@ -11,15 +11,23 @@ from google.genai import types
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_CONVERSATION_ID,
     GEN_AI_REQUEST_MODEL,
+    GEN_AI_TOOL_CALL_ARGUMENTS,
     GEN_AI_TOOL_CALL_ID,
+    GEN_AI_TOOL_CALL_RESULT,
     GEN_AI_TOOL_NAME,
 )
 from opentelemetry.trace import Status, StatusCode
 from ws_commands import ws_to_client_writer, client_reader_to_ws
 from mcp_bridge import JaegerMCPBridge
 from sidecar_config import SidecarConfig
-from sidecar_helpers import _to_tool_text
-from tracing import tracer
+from sidecar_helpers import (
+    _build_gemini_contextual_tool,
+    _extract_contextual_tools,
+    _to_tool_text,
+    _truncate_for_span,
+    _validate_function_call,
+)
+from tracing import extract_trace_context, tracer
 
 from acp import (
     PROTOCOL_VERSION,
@@ -34,13 +42,22 @@ from acp.helpers import start_tool_call, tool_content, update_tool_call
 from acp.interfaces import Client
 from acp.schema import (
     AgentCapabilities,
+    CloseSessionResponse,
     Implementation,
     ListSessionsResponse,
     LoadSessionResponse,
     NewSessionResponse,
+    SessionCapabilities,
+    SessionCloseCapabilities,
 )
 
 logger = logging.getLogger(__name__)
+
+# EXT_METHOD_JAEGER_TOOL_CALL is the ACP extension method the sidecar
+# invokes when Gemini requests a contextual (frontend-supplied) tool. The
+# Python ACP runtime prepends a single "_", so we drop the leading "_" we
+# share with the Go side (Go const "_meta/jaegertracing.io/tools/call").
+EXT_METHOD_JAEGER_TOOL_CALL = "meta/jaegertracing.io/tools/call"
 
 
 class JaegerSidecarAgent(Agent):
@@ -54,6 +71,12 @@ class JaegerSidecarAgent(Agent):
         self._mcp = JaegerMCPBridge(config.mcp_url, config.mcp_discovery_timeout_sec)
         self._next_session_id = 1
         self._next_tool_call_id = 1
+        # Per-session AG-UI tool snapshot pulled from NewSessionRequest._meta.
+        # Each entry is the raw tool definition dict the frontend supplied
+        # (shape: {name, description?, parameters?}). The agentic loop uses
+        # the names to decide whether a Gemini function_call dispatches via
+        # MCP (built-in) or via the ACP extension method (contextual).
+        self._contextual_tools: dict[str, list[dict[str, Any]]] = {}
 
     def _new_tool_call_id(self, tool_name: str) -> str:
         call_id = f"{tool_name}-{self._next_tool_call_id}"
@@ -95,25 +118,66 @@ class JaegerSidecarAgent(Agent):
         logger.info("Agent initialized with protocol version %s", protocol_version)
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
-            agent_capabilities=AgentCapabilities(),
+            agent_capabilities=AgentCapabilities(
+                session_capabilities=SessionCapabilities(close=SessionCloseCapabilities()),
+            ),
             agent_info=Implementation(name="jaeger-gemini-sidecar", title="Jaeger AI", version="0.1.0"),
         )
 
-    async def new_session(self, cwd: str, mcp_servers: Any = None, **kwargs: Any) -> NewSessionResponse:
+    async def new_session(
+        self,
+        cwd: str,
+        additional_directories: list[str] | None = None,
+        mcp_servers: Any = None,
+        **kwargs: Any,
+    ) -> NewSessionResponse:
         """Handle ACP `session/new` RPC.
 
         Invoked by ACP runtime dispatch (not direct app code) to allocate a new
         session id that the client will use for subsequent prompt calls.
+
+        Reads the optional contextual tools snapshot the gateway attaches via
+        NewSessionRequest._meta and stashes it per-session so the agentic loop
+        can merge those tools into the Gemini chat config. The Python ACP
+        router spreads ``_meta``'s inner keys into this handler's ``**kwargs``,
+        so ``kwargs`` itself is the meta dict to look up the namespaced key in.
         """
         session_id = f"sess-{self._next_session_id}"
         self._next_session_id += 1
+
+        contextual = _extract_contextual_tools(kwargs)
+        if contextual:
+            self._contextual_tools[session_id] = contextual
+            logger.info(
+                "Registered %d contextual tool(s) for session %s: %s",
+                len(contextual),
+                session_id,
+                [t.get("name") for t in contextual],
+            )
+
         return NewSessionResponse(session_id=session_id)
+
+    async def close_session(self, session_id: str, **kwargs: Any) -> CloseSessionResponse:
+        """Handle ACP `session/close` RPC.
+
+        Invoked by the gateway when an HTTP chat request finishes (success,
+        failure, or client disconnect mid-stream). Drops any per-session
+        bookkeeping the agent holds. ``pop(..., None)`` is idempotent so
+        sessions that never registered contextual tools — or that were
+        already cleaned up by ``prompt``'s ``finally`` block — are safe to
+        close again. Capability is advertised in ``initialize`` via
+        ``SessionCapabilities.close``.
+        """
+        self._contextual_tools.pop(session_id, None)
+        logger.info("Closed session %s", session_id)
+        return CloseSessionResponse()
 
     async def load_session(
         self,
         cwd: str,
         session_id: str,
         mcp_servers: Any = None,
+        additional_directories: list[str] | None = None,
         **kwargs: Any,
     ) -> LoadSessionResponse | None:
         """Handle ACP `session/load` RPC.
@@ -124,8 +188,8 @@ class JaegerSidecarAgent(Agent):
 
     async def list_sessions(
         self,
-        cursor: str | None = None,
         cwd: str | None = None,
+        cursor: str | None = None,
         **kwargs: Any,
     ) -> ListSessionsResponse:
         """Handle ACP `session/list` RPC.
@@ -134,13 +198,92 @@ class JaegerSidecarAgent(Agent):
         """
         return ListSessionsResponse(sessions=[])
 
+    async def _execute_contextual_tool(
+        self,
+        session_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+        tool_call_id: str,
+    ) -> Any:
+        """Dispatch a contextual (frontend-supplied) tool call back to the
+        gateway via the ACP extension method, fire-and-forget.
+
+        Two surfaces are involved and must not be conflated:
+
+        1. **AG-UI wire (browser):** the parallel ``session_update``
+           notifications below become ``TOOL_CALL_START`` /
+           ``TOOL_CALL_ARGS`` / ``TOOL_CALL_END`` SSE events. The browser
+           matches the tool name to its registered AG-UI tool and runs
+           ``execute(args)`` locally — *that* is the actual execution.
+           We deliberately do NOT populate ``raw_output`` / ``content`` on
+           the completion update: doing so would cause the streaming
+           client to emit ``TOOL_CALL_RESULT``, which tricks assistant-ui
+           into thinking the server already produced a result and skips
+           the local ``execute()``.
+
+        2. **LLM loop (Gemini):** the ext_method returns the gateway's
+           synthetic ``{"acknowledged": true}`` ack, which we feed back
+           into the agentic loop as the function response so Gemini
+           produces a final text answer. We never wait for the browser to
+           confirm — that's the "forget" half of fire-and-forget.
+        """
+        with tracer().start_as_current_span("sidecar.execute_contextual_tool", attributes={
+            GEN_AI_TOOL_NAME: tool_name,
+            GEN_AI_TOOL_CALL_ID: tool_call_id,
+            GEN_AI_CONVERSATION_ID: session_id,
+            GEN_AI_TOOL_CALL_ARGUMENTS: _truncate_for_span(_to_tool_text(args)),
+        }) as span:
+            try:
+                _validate_function_call(tool_name, args, tool_call_id)
+                conn = self._require_conn()
+                # raw_input carries the LLM-generated arguments onto the
+                # AG-UI wire as TOOL_CALL_ARGS so the browser knows what
+                # to highlight / render / etc.
+                await conn.session_update(
+                    session_id,
+                    start_tool_call(
+                        tool_call_id,
+                        tool_name,
+                        kind="other",
+                        status="in_progress",
+                        raw_input=args,
+                    ),
+                )
+
+                response = await conn.ext_method(
+                    EXT_METHOD_JAEGER_TOOL_CALL,
+                    {"sessionId": session_id, "name": tool_name, "args": args},
+                )
+                # response is the gateway's synthetic ack, not the tool's actual
+                # output (see docstring: fire-and-forget, real result never
+                # comes back here) — so gen_ai.tool.call.result is deliberately
+                # not set for this path to avoid mislabeling the ack as a result.
+
+                # Status=completed alone fires TOOL_CALL_END (no RESULT)
+                # because raw_output is intentionally absent — see the
+                # method docstring for why.
+                await conn.session_update(
+                    session_id,
+                    update_tool_call(
+                        tool_call_id,
+                        status="completed",
+                    ),
+                )
+                return response
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, description=str(e)))
+                raise
+
     async def _execute_tool(self, session_id: str, tool_name: str, args: dict[str, Any], tool_call_id: str) -> Any:
         with tracer().start_as_current_span("sidecar.execute_tool", attributes={
             GEN_AI_TOOL_NAME: tool_name,
             GEN_AI_TOOL_CALL_ID: tool_call_id,
             GEN_AI_CONVERSATION_ID: session_id,
+            GEN_AI_TOOL_CALL_ARGUMENTS: _truncate_for_span(_to_tool_text(args)),
         }) as span:
             try:
+                _validate_function_call(tool_name, args, tool_call_id)
                 conn = self._require_conn()
                 await conn.session_update(
                     session_id,
@@ -154,6 +297,7 @@ class JaegerSidecarAgent(Agent):
 
                 tool_output = await self._mcp.call_tool(tool_name, args)
                 output_text = _to_tool_text(tool_output)
+                span.set_attribute(GEN_AI_TOOL_CALL_RESULT, _truncate_for_span(output_text))
 
                 await conn.session_update(
                     session_id,
@@ -188,17 +332,30 @@ class JaegerSidecarAgent(Agent):
             )
 
             mcp_tools = await self._mcp.get_gemini_tools()
-            tool_names: list[str] = []
+            mcp_tool_names: set[str] = set()
             for tool in mcp_tools:
                 if tool.function_declarations:
-                    tool_names.extend(fd.name for fd in tool.function_declarations if fd.name)
-            logger.info("Passing tools to Gemini: %s", tool_names)
+                    mcp_tool_names.update(fd.name for fd in tool.function_declarations if fd.name)
+
+            contextual_tools = self._contextual_tools.get(session_id, [])
+            contextual_tool_names = {t["name"] for t in contextual_tools if t.get("name")}
+            contextual_gemini_tool = _build_gemini_contextual_tool(contextual_tools)
+
+            tools_for_gemini: list[Any] = list(mcp_tools)
+            if contextual_gemini_tool is not None:
+                tools_for_gemini.append(contextual_gemini_tool)
+
+            logger.info(
+                "Passing tools to Gemini: mcp=%s contextual=%s",
+                sorted(mcp_tool_names),
+                sorted(contextual_tool_names),
+            )
 
             chat = self._gemini.chats.create(
                 model="gemini-2.5-flash",
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    tools=cast(Any, mcp_tools),
+                    tools=cast(Any, tools_for_gemini),
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 ),
             )
@@ -217,10 +374,14 @@ class JaegerSidecarAgent(Agent):
 
                 for function_call in function_calls:
                     name = function_call.name or ""
-                    args = function_call.args or {}
-                    call_id = function_call.id or self._new_tool_call_id(name)
-                    logger.info("Gemini requested tool call: %s (call_id=%s)", name, call_id)
-                    tool_output = await self._execute_tool(session_id, name, args, call_id)
+                    args = function_call.args or dict[str, Any]()
+                    call_id = function_call.id or self._new_tool_call_id(name or "unnamed")
+                    if name in contextual_tool_names:
+                        logger.info("Gemini requested contextual tool call: %s (call_id=%s)", name, call_id)
+                        tool_output = await self._execute_contextual_tool(session_id, name, args, call_id)
+                    else:
+                        logger.info("Gemini requested MCP tool call: %s (call_id=%s)", name, call_id)
+                        tool_output = await self._execute_tool(session_id, name, args, call_id)
                     function_responses.append(
                         types.Part.from_function_response(name=name, response={"result": tool_output})
                     )
@@ -231,8 +392,8 @@ class JaegerSidecarAgent(Agent):
 
     async def prompt(
         self,
-        prompt: list[Any],
         session_id: str,
+        prompt: list[Any],
         message_id: str | None = None,
         **kwargs: Any,
     ) -> PromptResponse:
@@ -241,7 +402,8 @@ class JaegerSidecarAgent(Agent):
         Invoked by ACP runtime dispatch after initialize/session handshake; this
         is the protocol entrypoint for prompt execution.
         """
-        with tracer().start_as_current_span("sidecar.prompt", attributes={
+        parent_ctx = extract_trace_context(kwargs)
+        with tracer().start_as_current_span("sidecar.prompt", context=parent_ctx, attributes={
             GEN_AI_CONVERSATION_ID: session_id,
         }) as span:
             logger.info("Received prompt request for session %s", session_id)
@@ -277,6 +439,15 @@ class JaegerSidecarAgent(Agent):
                     session_id,
                     update_agent_message(text_block(f"\n[Error: {str(e)}]"))
                 )
+            finally:
+                # Drop the per-session contextual tools snapshot now that
+                # the prompt has finished. The Jaeger AI gateway opens one
+                # ACP session per chat request and never reuses the
+                # session_id, so without this cleanup the dict would grow
+                # unbounded over the sidecar's lifetime. pop(..., None)
+                # is idempotent — safe even if no entry exists for this
+                # session (which is the common PR1 case).
+                self._contextual_tools.pop(session_id, None)
 
             return PromptResponse(stop_reason="end_turn")
 

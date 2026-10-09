@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +25,8 @@ import (
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/config/configtls"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	traceapi "go.opentelemetry.io/otel/trace"
@@ -33,11 +37,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/jaegertracing/jaeger-idl/model/v1"
 	"github.com/jaegertracing/jaeger-idl/proto-gen/api_v2"
 	"github.com/jaegertracing/jaeger/cmd/jaeger/internal/extension/jaegerquery/querysvc"
 	"github.com/jaegertracing/jaeger/internal/grpctest"
+	"github.com/jaegertracing/jaeger/internal/headerforwarding"
 	depsmocks "github.com/jaegertracing/jaeger/internal/storage/v2/api/depstore/mocks"
 	"github.com/jaegertracing/jaeger/internal/storage/v2/api/tracestore"
 	tracestoremocks "github.com/jaegertracing/jaeger/internal/storage/v2/api/tracestore/mocks"
@@ -48,11 +54,24 @@ import (
 
 var testCertKeyLocation = "../../../../../../internal/config/tlscfg/testdata"
 
+// findTracesQueryString is a well-formed search request against the api_v3 HTTP
+// gateway, used by the tests below that exercise TLS and tenancy plumbing
+// through the real HTTP server rather than the search behavior itself.
+const findTracesQueryString = "/api/v3/traces?query.serviceName=service" +
+	"&query.startTimeMin=1970-01-01T00:00:00Z&query.startTimeMax=1970-01-02T00:00:00Z"
+
 func initTelSet(logger *zap.Logger, tracerProvider traceapi.TracerProvider) telemetry.Settings {
 	telset := telemetry.NoopSettings()
 	telset.Logger = logger
 	telset.TracerProvider = tracerProvider
 	return telset
+}
+
+var nilBackendCaps BackendCapabilityProvider
+
+// noopTenancyMgr returns a manager with multi-tenancy disabled.
+func noopTenancyMgr() *tenancy.Manager {
+	return tenancy.NewManager(&tenancy.Options{})
 }
 
 func TestServerError(t *testing.T) {
@@ -90,8 +109,7 @@ func TestCreateTLSServerSinglePortError(t *testing.T) {
 			},
 			GRPC: configgrpc.ServerConfig{NetAddr: confignet.AddrConfig{Endpoint: ":8080", Transport: confignet.TransportTypeTCP}, TLS: configoptional.Some(tlsCfg)},
 		},
-		querysvc.StorageCapabilities{},
-		tenancy.NewManager(&tenancy.Options{}), telset)
+		nilBackendCaps, noopTenancyMgr(), telset)
 	require.Error(t, err)
 }
 
@@ -114,8 +132,7 @@ func TestCreateTLSGrpcServerError(t *testing.T) {
 			},
 			GRPC: configgrpc.ServerConfig{NetAddr: confignet.AddrConfig{Endpoint: ":8081", Transport: confignet.TransportTypeTCP}, TLS: configoptional.Some(tlsCfg)},
 		},
-		querysvc.StorageCapabilities{},
-		tenancy.NewManager(&tenancy.Options{}), telset)
+		nilBackendCaps, noopTenancyMgr(), telset)
 	require.Error(t, err)
 }
 
@@ -139,8 +156,7 @@ func TestStartTLSHttpServerError(t *testing.T) {
 			},
 			GRPC: configgrpc.ServerConfig{NetAddr: confignet.AddrConfig{Endpoint: ":8081", Transport: confignet.TransportTypeTCP}},
 		},
-		querysvc.StorageCapabilities{},
-		tenancy.NewManager(&tenancy.Options{}), telset)
+		nilBackendCaps, noopTenancyMgr(), telset)
 	require.NoError(t, err)
 	require.Error(t, s.Start(context.Background()))
 	t.Cleanup(func() {
@@ -353,6 +369,9 @@ func makeQuerySvc() *fakeQueryService {
 	dependencyReader := &depsmocks.Reader{}
 	expectedServices := []string{"test"}
 	traceReader.On("GetServices", mock.Anything).Return(expectedServices, nil)
+	// Serving index.html asks what to inject into the capability blob.
+	traceReader.On("SearchCapabilities", mock.Anything).
+		Return(tracestore.SearchCapabilities{}, nil).Maybe()
 	qs := querysvc.NewQueryService(traceReader, dependencyReader, querysvc.QueryServiceOptions{})
 	return &fakeQueryService{
 		qs:               qs,
@@ -441,7 +460,7 @@ func TestServerHTTPTLS(t *testing.T) {
 			querySvc := makeQuerySvc()
 
 			server, err := NewServer(context.Background(), querySvc.qs, nil,
-				serverOptions, querysvc.StorageCapabilities{}, tenancy.NewManager(&tenancy.Options{}), telset)
+				serverOptions, nilBackendCaps, noopTenancyMgr(), telset)
 			require.NoError(t, err)
 			require.NoError(t, server.Start(context.Background()))
 			t.Cleanup(func() {
@@ -460,7 +479,7 @@ func TestServerHTTPTLS(t *testing.T) {
 					Return(iter.Seq2[[]ptrace.Traces, error](func(yield func([]ptrace.Traces, error) bool) {
 						yield([]ptrace.Traces{makeMockPTrace()}, nil)
 					})).Once()
-				queryString := "/api/traces?service=service&start=0&end=0&operation=operation&limit=200&minDuration=20ms"
+				queryString := findTracesQueryString
 				req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://%s/%s", server.HTTPAddr(), queryString), http.NoBody)
 				require.NoError(t, err)
 				req.Header.Add("Accept", "application/json")
@@ -554,7 +573,7 @@ func TestServerGRPCTLS(t *testing.T) {
 			querySvc := makeQuerySvc()
 			telset := initTelSet(logger, nooptrace.NewTracerProvider())
 			server, err := NewServer(context.Background(), querySvc.qs,
-				nil, serverOptions, querysvc.StorageCapabilities{}, tenancy.NewManager(&tenancy.Options{}),
+				nil, serverOptions, nilBackendCaps, noopTenancyMgr(),
 				telset)
 			require.NoError(t, err)
 			require.NoError(t, server.Start(context.Background()))
@@ -611,8 +630,7 @@ func TestServerBadHostPort(t *testing.T) {
 				},
 			},
 		},
-		querysvc.StorageCapabilities{},
-		tenancy.NewManager(&tenancy.Options{}),
+		nilBackendCaps, noopTenancyMgr(),
 		telset)
 	require.Error(t, err)
 
@@ -632,8 +650,7 @@ func TestServerBadHostPort(t *testing.T) {
 				},
 			},
 		},
-		querysvc.StorageCapabilities{},
-		tenancy.NewManager(&tenancy.Options{}),
+		nilBackendCaps, noopTenancyMgr(),
 		telset)
 
 	require.Error(t, err)
@@ -674,8 +691,7 @@ func TestServerInUseHostPort(t *testing.T) {
 						},
 					},
 				},
-				querysvc.StorageCapabilities{},
-				tenancy.NewManager(&tenancy.Options{}),
+				nilBackendCaps, noopTenancyMgr(),
 				telset,
 			)
 			require.NoError(t, err)
@@ -704,8 +720,7 @@ func TestServerGracefulExit(t *testing.T) {
 			},
 			GRPC: configgrpc.ServerConfig{NetAddr: confignet.AddrConfig{Endpoint: ":0", Transport: confignet.TransportTypeTCP}},
 		},
-		querysvc.StorageCapabilities{},
-		tenancy.NewManager(&tenancy.Options{}), telset)
+		nilBackendCaps, noopTenancyMgr(), telset)
 	require.NoError(t, err)
 	require.NoError(t, server.Start(context.Background()))
 
@@ -750,8 +765,7 @@ func TestServerHandlesPortZero(t *testing.T) {
 				},
 			},
 		},
-		querysvc.StorageCapabilities{},
-		tenancy.NewManager(&tenancy.Options{}),
+		nilBackendCaps, noopTenancyMgr(),
 		telset)
 	require.NoError(t, err)
 	require.NoError(t, server.Start(context.Background()))
@@ -765,6 +779,7 @@ func TestServerHandlesPortZero(t *testing.T) {
 		ExpectedServices: []string{
 			"jaeger.api_v2.QueryService",
 			"jaeger.api_v3.QueryService",
+			"jaeger.api_v3.Capabilities",
 			"grpc.health.v1.Health",
 		},
 	}.Execute(t)
@@ -813,7 +828,7 @@ func TestServerHTTPTenancy(t *testing.T) {
 		})).Once()
 	telset := initTelSet(zaptest.NewLogger(t), nooptrace.NewTracerProvider())
 	server, err := NewServer(context.Background(), querySvc.qs,
-		nil, serverOptions, querysvc.StorageCapabilities{}, tenancyMgr, telset)
+		nil, serverOptions, nilBackendCaps, tenancyMgr, telset)
 	require.NoError(t, err)
 	require.NoError(t, server.Start(context.Background()))
 	t.Cleanup(func() {
@@ -825,7 +840,7 @@ func TestServerHTTPTenancy(t *testing.T) {
 			conn, clientError := net.DialTimeout("tcp", server.HTTPAddr(), 2*time.Second)
 			require.NoError(t, clientError)
 
-			queryString := "/api/traces?service=service&start=0&end=0&operation=operation&limit=200&minDuration=20ms"
+			queryString := findTracesQueryString
 			req, err := http.NewRequest(http.MethodGet, "http://"+server.HTTPAddr()+queryString, http.NoBody)
 			if test.tenant != "" {
 				req.Header.Add(tenancyMgr.Header, test.tenant)
@@ -913,7 +928,7 @@ func TestServerHTTP_TracesRequest(t *testing.T) {
 			telset := initTelSet(zaptest.NewLogger(t), tracerProvider)
 
 			server, err := NewServer(context.Background(), querySvc.qs,
-				nil, serverOptions, querysvc.StorageCapabilities{}, tenancyMgr, telset)
+				nil, serverOptions, nilBackendCaps, tenancyMgr, telset)
 			require.NoError(t, err)
 			require.NoError(t, server.Start(context.Background()))
 			t.Cleanup(func() {
@@ -961,7 +976,7 @@ func TestServerAPINotFound(t *testing.T) {
 			tenancyMgr := tenancy.NewManager(&serverOptions.Tenancy)
 			telset := initTelSet(zaptest.NewLogger(t), nooptrace.NewTracerProvider())
 
-			server, err := NewServer(context.Background(), querySvc.qs, nil, serverOptions, querysvc.StorageCapabilities{}, tenancyMgr, telset)
+			server, err := NewServer(context.Background(), querySvc.qs, nil, serverOptions, nilBackendCaps, tenancyMgr, telset)
 			require.NoError(t, err)
 			require.NoError(t, server.Start(context.Background()))
 			t.Cleanup(func() {
@@ -975,7 +990,7 @@ func TestServerAPINotFound(t *testing.T) {
 			}{
 				{
 					name:           "existing API endpoint returns 200",
-					path:           basePath + "/api/services",
+					path:           basePath + "/api/v3/services",
 					expectedStatus: http.StatusOK,
 				},
 				{
@@ -1007,21 +1022,101 @@ func TestServerAPINotFound(t *testing.T) {
 	}
 }
 
+func TestServerGRPC_HeaderForwarding(t *testing.T) {
+	traceReader := &tracestoremocks.Reader{}
+	dependencyReader := &depsmocks.Reader{}
+
+	var capturedCtx context.Context
+	traceReader.On("GetServices", mock.Anything).
+		Run(func(args mock.Arguments) { capturedCtx = args.Get(0).(context.Context) }).
+		Return([]string{"svc"}, nil)
+	qs := querysvc.NewQueryService(traceReader, dependencyReader, querysvc.QueryServiceOptions{})
+
+	opts := &QueryOptions{
+		HeaderForwarding: []headerforwarding.ForwardedHeader{
+			{HTTPName: "x-user", GRPCName: "x-grpc-user", Role: headerforwarding.RoleUsername},
+		},
+		HTTP: confighttp.ServerConfig{NetAddr: confignet.AddrConfig{Endpoint: ":0", Transport: confignet.TransportTypeTCP}},
+		GRPC: configgrpc.ServerConfig{NetAddr: confignet.AddrConfig{Endpoint: ":0", Transport: confignet.TransportTypeTCP}},
+	}
+	telset := initTelSet(zaptest.NewLogger(t), nooptrace.NewTracerProvider())
+	server, err := NewServer(context.Background(), qs, nil, opts, nilBackendCaps, noopTenancyMgr(), telset)
+	require.NoError(t, err)
+	require.NoError(t, server.Start(context.Background()))
+	t.Cleanup(func() { require.NoError(t, server.Close()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("x-grpc-user", "alice"))
+
+	client := newGRPCClient(t, server.GRPCAddr())
+	t.Cleanup(func() { require.NoError(t, client.conn.Close()) })
+
+	_, err = client.GetServices(ctx, &api_v2.GetServicesRequest{})
+	require.NoError(t, err)
+
+	require.NotNil(t, capturedCtx, "GetServices was not called")
+	var gotUser string
+	for _, c := range headerforwarding.CapturedFromContext(capturedCtx) {
+		if c.Header.HTTPName == "x-user" {
+			gotUser = c.Value
+		}
+	}
+	assert.Equal(t, "alice", gotUser)
+}
+
+func TestInitRouter_HeaderForwarding(t *testing.T) {
+	telset := initTelSet(zaptest.NewLogger(t), nooptrace.NewTracerProvider())
+	traceReader := &tracestoremocks.Reader{}
+	dependencyReader := &depsmocks.Reader{}
+
+	// Capture the context that reaches GetServices so we can assert the middleware injected the header.
+	var capturedCtx context.Context
+	traceReader.On("GetServices", mock.Anything).
+		Run(func(args mock.Arguments) { capturedCtx = args.Get(0).(context.Context) }).
+		Return([]string{"svc"}, nil)
+	qs := querysvc.NewQueryService(traceReader, dependencyReader, querysvc.QueryServiceOptions{})
+
+	tenancyMgr := noopTenancyMgr()
+	opts := DefaultQueryOptions()
+	opts.HeaderForwarding = []headerforwarding.ForwardedHeader{
+		{HTTPName: "x-user", Role: headerforwarding.RoleUsername},
+	}
+
+	handler, cs, err := initRouter(context.Background(), qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, cs.Close()) })
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v3/services", http.NoBody)
+	req.Header.Set("x-user", "alice")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	require.NotNil(t, capturedCtx, "GetServices was not called")
+	var gotUser string
+	for _, c := range headerforwarding.CapturedFromContext(capturedCtx) {
+		if c.Header.HTTPName == "x-user" {
+			gotUser = c.Value
+		}
+	}
+	assert.Equal(t, "alice", gotUser)
+}
+
 func TestInitRouterAIHandlerRegistration(t *testing.T) {
 	telset := initTelSet(zaptest.NewLogger(t), nooptrace.NewTracerProvider())
 	querySvc := makeQuerySvc()
-	tenancyMgr := tenancy.NewManager(&tenancy.Options{})
+	tenancyMgr := noopTenancyMgr()
 
 	t.Run("ai handler disabled when sidecar url empty", func(t *testing.T) {
 		opts := DefaultQueryOptions()
 		opts.AI = configoptional.Some(AIConfig{AgentURL: ""})
 
-		handler, closer := initRouter(querySvc.qs, nil, &opts, querysvc.StorageCapabilities{}, tenancyMgr, telset)
+		handler, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.NoError(t, err)
 		t.Cleanup(func() {
-			require.NoError(t, closer.Close())
+			require.NoError(t, cs.Close())
 		})
 
-		req := httptest.NewRequest(http.MethodPost, "/api/ai/chat", strings.NewReader(`{"prompt":"hello"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/ai/chat", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
 
@@ -1032,12 +1127,13 @@ func TestInitRouterAIHandlerRegistration(t *testing.T) {
 		opts := DefaultQueryOptions()
 		opts.AI = configoptional.Some(AIConfig{AgentURL: "ws://127.0.0.1:1", MaxRequestBodySize: 1 << 20})
 
-		handler, closer := initRouter(querySvc.qs, nil, &opts, querysvc.StorageCapabilities{}, tenancyMgr, telset)
+		handler, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.NoError(t, err)
 		t.Cleanup(func() {
-			require.NoError(t, closer.Close())
+			require.NoError(t, cs.Close())
 		})
 
-		req := httptest.NewRequest(http.MethodPost, "/api/ai/chat", strings.NewReader(`{"prompt":"hello"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/ai/chat", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
 
@@ -1049,15 +1145,326 @@ func TestInitRouterAIHandlerRegistration(t *testing.T) {
 		opts.BasePath = "/jaeger"
 		opts.AI = configoptional.Some(AIConfig{AgentURL: "ws://127.0.0.1:1", MaxRequestBodySize: 1 << 20})
 
-		handler, closer := initRouter(querySvc.qs, nil, &opts, querysvc.StorageCapabilities{}, tenancyMgr, telset)
+		handler, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.NoError(t, err)
 		t.Cleanup(func() {
-			require.NoError(t, closer.Close())
+			require.NoError(t, cs.Close())
 		})
 
-		req := httptest.NewRequest(http.MethodPost, "/jaeger/api/ai/chat", strings.NewReader(`{"prompt":"hello"}`))
+		req := httptest.NewRequest(http.MethodPost, "/jaeger/api/ai/chat", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
 
 		require.Equal(t, http.StatusBadGateway, rr.Code)
 	})
+
+	// An unusable skills_dir is broken configuration, so it has to stop the
+	// server coming up rather than degrade to serving no custom skills.
+	t.Run("unusable skills_dir aborts startup", func(t *testing.T) {
+		opts := DefaultQueryOptions()
+		opts.AI = configoptional.Some(AIConfig{
+			MCP:                configoptional.Some(MCPConfig{SkillsDir: filepath.Join(t.TempDir(), "no-such-dir")}),
+			MaxRequestBodySize: 1 << 20,
+		})
+
+		_, _, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.ErrorContains(t, err, "cannot open skills_dir")
+	})
+
+	// skills_dir stays open for as long as it is served, so the server has to
+	// hand it back as a closer rather than leave it to process exit.
+	t.Run("skills_dir is closed with the server", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("catalog"), 0o600))
+		opts := DefaultQueryOptions()
+		opts.AI = configoptional.Some(AIConfig{
+			MCP:                configoptional.Some(MCPConfig{SkillsDir: dir}),
+			MaxRequestBodySize: 1 << 20,
+		})
+
+		_, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.NoError(t, err)
+		require.NoError(t, cs.Close())
+	})
+
+	t.Run("mcp endpoint mounted in MCP-only mode", func(t *testing.T) {
+		opts := DefaultQueryOptions()
+		opts.AI = configoptional.Some(AIConfig{MCP: configoptional.Some(MCPConfig{}), MaxRequestBodySize: 1 << 20})
+
+		handler, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			require.NoError(t, cs.Close())
+		})
+
+		// The telemetry MCP route is mounted (not 404); chat is not, since
+		// AgentURL is empty.
+		mcpReq := httptest.NewRequest(http.MethodGet, "/api/ai/mcp/", http.NoBody)
+		mcpRR := httptest.NewRecorder()
+		handler.ServeHTTP(mcpRR, mcpReq)
+		require.NotEqual(t, http.StatusNotFound, mcpRR.Code)
+
+		chatReq := httptest.NewRequest(http.MethodPost, "/api/ai/chat", strings.NewReader(`{}`))
+		chatRR := httptest.NewRecorder()
+		handler.ServeHTTP(chatRR, chatReq)
+		require.Equal(t, http.StatusNotFound, chatRR.Code)
+	})
+
+	t.Run("mcp endpoint mounted with base path", func(t *testing.T) {
+		opts := DefaultQueryOptions()
+		opts.BasePath = "/jaeger"
+		opts.AI = configoptional.Some(AIConfig{MCP: configoptional.Some(MCPConfig{}), MaxRequestBodySize: 1 << 20})
+
+		handler, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			require.NoError(t, cs.Close())
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/jaeger/api/ai/mcp/", http.NoBody)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		require.NotEqual(t, http.StatusNotFound, rr.Code)
+	})
+
+	t.Run("chat and MCP both enabled: session-free and session-scoped endpoints coexist", func(t *testing.T) {
+		opts := DefaultQueryOptions()
+		opts.AI = configoptional.Some(AIConfig{AgentURL: "ws://127.0.0.1:1", MCP: configoptional.Some(MCPConfig{}), MaxRequestBodySize: 1 << 20})
+
+		// initRouter registers both /api/ai/mcp/ (session-free, jaeger-query)
+		// and /api/ai/mcp/{sessionID}/ (session-scoped, jaegerai) on the same
+		// mux. ServeMux panics on conflicting patterns, so a clean return here
+		// is itself the coexistence assertion.
+		handler, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			require.NoError(t, cs.Close())
+		})
+
+		// Session-free endpoint is mounted.
+		freeRR := httptest.NewRecorder()
+		handler.ServeHTTP(freeRR, httptest.NewRequest(http.MethodGet, "/api/ai/mcp/", http.NoBody))
+		require.NotEqual(t, http.StatusNotFound, freeRR.Code, "session-free endpoint must be mounted")
+
+		// Session-scoped endpoint is mounted and takes precedence: an unknown
+		// session id reaches the session-scoped handler and is rejected (404).
+		// If it were NOT mounted, the session-free subtree pattern would match
+		// this path and serve telemetry (not 404) instead. Both the slash and
+		// no-slash forms must behave this way.
+		for _, scopedPath := range []string{"/api/ai/mcp/ghost/mcp", "/api/ai/mcp/ghost"} {
+			scopedRR := httptest.NewRecorder()
+			handler.ServeHTTP(scopedRR, httptest.NewRequest(http.MethodGet, scopedPath, http.NoBody))
+			require.Equal(t, http.StatusNotFound, scopedRR.Code,
+				"session-scoped endpoint must be mounted and reject unknown session at %s", scopedPath)
+		}
+	})
+}
+
+// TestMountSharedMCP_BasePathNormalization checks the mount prefix directly
+// (bypassing initRouter's other routes) so a trailing slash or bare "/" can't
+// produce a double-slash pattern. BasePath is normalized at config load, so
+// this guards the defensive normalization in mountSharedMCP.
+func TestMountSharedMCP_BasePathNormalization(t *testing.T) {
+	telset := initTelSet(zaptest.NewLogger(t), nooptrace.NewTracerProvider())
+
+	for _, basePath := range []string{"", "/", "/jaeger", "/jaeger/"} {
+		t.Run("base path "+basePath, func(t *testing.T) {
+			r := http.NewServeMux()
+			// Must not panic on a double-slash pattern.
+			require.NotPanics(t, func() {
+				mountSharedMCP(r, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), basePath, telset)
+			})
+
+			want := "/api/ai/mcp/"
+			if basePath == "/jaeger" || basePath == "/jaeger/" {
+				want = "/jaeger/api/ai/mcp/"
+			}
+			req := httptest.NewRequest(http.MethodGet, want, http.NoBody)
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+			require.NotEqual(t, http.StatusNotFound, rr.Code)
+		})
+	}
+}
+
+func TestOTLPProxyPathPrefix(t *testing.T) {
+	require.Equal(t, "/api/otlp", otlpProxyPathPrefix(""))
+	require.Equal(t, "/api/otlp", otlpProxyPathPrefix("/"))
+	require.Equal(t, "/jaeger/api/otlp", otlpProxyPathPrefix("/jaeger"))
+}
+
+func TestOtelFilterFunc(t *testing.T) {
+	filter := otelFilterFunc("")
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/api/v3/services", true},
+		{"/static/bundle.js", false},
+		{"/api/otlp/v1/traces", false},
+	}
+	for _, tt := range tests {
+		req := httptest.NewRequest(http.MethodGet, tt.path, http.NoBody)
+		assert.Equal(t, tt.want, filter(req), "path: %s", tt.path)
+	}
+}
+
+func TestInitRouterOTLPProxy(t *testing.T) {
+	telset := initTelSet(zaptest.NewLogger(t), nooptrace.NewTracerProvider())
+	querySvc := makeQuerySvc()
+	tenancyMgr := noopTenancyMgr()
+
+	t.Run("absent block does not register the route", func(t *testing.T) {
+		opts := DefaultQueryOptions()
+		require.False(t, opts.OTLPProxy.HasValue())
+
+		handler, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, cs.Close()) })
+
+		req := httptest.NewRequest(http.MethodPost, "/api/otlp/v1/traces", strings.NewReader(`{}`))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusNotFound, rr.Code)
+	})
+
+	// Spin up a stub upstream so we can verify the proxy forwards correctly.
+	type captured struct {
+		path        string
+		body        string
+		contentType string
+	}
+	stub := func() (*httptest.Server, *captured) {
+		got := &captured{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got.path = r.URL.Path
+			got.contentType = r.Header.Get("Content-Type")
+			buf := make([]byte, r.ContentLength)
+			n, _ := r.Body.Read(buf)
+			got.body = string(buf[:n])
+			w.WriteHeader(http.StatusOK)
+		}))
+		return srv, got
+	}
+
+	t.Run("forwards to upstream with prefix stripped", func(t *testing.T) {
+		upstream, got := stub()
+		t.Cleanup(upstream.Close)
+
+		opts := DefaultQueryOptions()
+		opts.OTLPProxy = configoptional.Some(OTLPProxyConfig{Target: upstream.URL})
+
+		handler, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, cs.Close()) })
+
+		req := httptest.NewRequest(http.MethodPost, "/api/otlp/v1/traces", strings.NewReader("payload"))
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, "/v1/traces", got.path, "the /api/otlp prefix must be stripped before forwarding")
+		require.Equal(t, "application/x-protobuf", got.contentType)
+		require.Equal(t, "payload", got.body)
+	})
+
+	t.Run("honors BasePath", func(t *testing.T) {
+		upstream, got := stub()
+		t.Cleanup(upstream.Close)
+
+		opts := DefaultQueryOptions()
+		opts.BasePath = "/jaeger"
+		opts.OTLPProxy = configoptional.Some(OTLPProxyConfig{Target: upstream.URL})
+
+		handler, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, cs.Close()) })
+
+		req := httptest.NewRequest(http.MethodPost, "/jaeger/api/otlp/v1/traces", strings.NewReader("payload"))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, "/v1/traces", got.path)
+
+		// The same request without the BasePath should miss the proxy and 404
+		// via the apiNotFoundPattern catch-all.
+		got.path = ""
+		req2 := httptest.NewRequest(http.MethodPost, "/api/otlp/v1/traces", strings.NewReader("payload"))
+		rr2 := httptest.NewRecorder()
+		handler.ServeHTTP(rr2, req2)
+		require.Equal(t, http.StatusNotFound, rr2.Code)
+		require.Empty(t, got.path, "request without BasePath must not reach the upstream")
+	})
+
+	t.Run("returns error when target is unparseable", func(t *testing.T) {
+		opts := DefaultQueryOptions()
+		opts.OTLPProxy = configoptional.Some(OTLPProxyConfig{Target: "://not a url"})
+
+		_, _, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+		require.ErrorContains(t, err, "invalid OTLP proxy target")
+	})
+}
+
+func TestInitRouterOTLPProxyEmitsMetrics(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { require.NoError(t, mp.Shutdown(context.Background())) })
+
+	spanExporter := tracetest.NewInMemoryExporter()
+	tp := tracesdk.NewTracerProvider(tracesdk.WithSyncer(spanExporter))
+	t.Cleanup(func() { require.NoError(t, tp.Shutdown(context.Background())) })
+
+	telset := initTelSet(zaptest.NewLogger(t), tp)
+	telset.MeterProvider = mp
+
+	opts := DefaultQueryOptions()
+	opts.OTLPProxy = configoptional.Some(OTLPProxyConfig{Target: upstream.URL})
+
+	querySvc := makeQuerySvc()
+	tenancyMgr := noopTenancyMgr()
+	handler, cs, err := initRouter(context.Background(), querySvc.qs, nil, &opts, nilBackendCaps, tenancyMgr, telset)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, cs.Close()) })
+
+	for range 3 {
+		req := httptest.NewRequest(http.MethodPost, "/api/otlp/v1/traces", strings.NewReader("payload"))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+	}
+
+	require.Empty(t, spanExporter.GetSpans(),
+		"OTLP proxy route must not produce server spans (uses noop tracer)")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+
+	var foundCount uint64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if !strings.HasPrefix(m.Name, "http.server.") {
+				continue
+			}
+			switch agg := m.Data.(type) {
+			case metricdata.Histogram[float64]:
+				for _, dp := range agg.DataPoints {
+					foundCount += dp.Count
+				}
+			case metricdata.Histogram[int64]:
+				for _, dp := range agg.DataPoints {
+					foundCount += dp.Count
+				}
+			default:
+			}
+		}
+	}
+	require.GreaterOrEqual(t, foundCount, uint64(3),
+		"expected at least 3 HTTP server metric measurements (one per request) from the OTLP proxy")
 }

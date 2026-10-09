@@ -30,7 +30,6 @@ import (
 const (
 	host = "0.0.0.0"
 
-	getServicesURL         = "/api/services"
 	getTraceURL            = "/api/traces/"
 	getServicesAPIV3URL    = "/api/v3/services"
 	getSamplingStrategyURL = "/api/sampling?service=whatever"
@@ -65,7 +64,8 @@ func TestAllInOne(t *testing.T) {
 }
 
 func healthCheck(t *testing.T) {
-	require.Eventuallyf(t,
+	require.Eventuallyf(
+		t,
 		func() bool {
 			resp, err := http.Get(queryAddr + "/")
 			if err == nil {
@@ -84,7 +84,8 @@ func healthCheckV2(t *testing.T) {
 	if os.Getenv("HEALTHCHECK_V2") == "false" {
 		t.Skip("Skipping health check for V1 Binary")
 	}
-	require.Eventuallyf(t,
+	require.Eventuallyf(
+		t,
 		func() bool {
 			resp, err := http.Get(healthAddr)
 			if err == nil {
@@ -139,7 +140,7 @@ func checkWebUI(t *testing.T) {
 func createTrace(t *testing.T) {
 	// Since all requests to query service are traces, creating a new trace
 	// is simply a matter of querying one of the endpoints.
-	resp, _ := httpGet(t, queryAddr+getServicesURL)
+	resp, _ := httpGet(t, queryAddr+getServicesAPIV3URL)
 	traceResponse := resp.Header.Get("traceresponse")
 	// Expecting: [version] [trace-id] [child-id] [trace-flags]
 	parts := strings.Split(traceResponse, "-")
